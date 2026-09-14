@@ -43,6 +43,9 @@ func TestCookieRoundTrip(t *testing.T) {
 	if len(cookies) == 0 {
 		t.Fatal("no cookie set")
 	}
+	if !cookies[0].HttpOnly {
+		t.Fatal("session cookie must be HttpOnly")
+	}
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(cookies[0])
 	got, err := GetSessionFromCookie(req, secret)

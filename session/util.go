@@ -42,16 +42,45 @@ func validateHMAC(message, sig string, secret []byte) bool {
 
 // SetSessionCookie serializes session data, signs it, and sets it as an HTTP cookie
 func SetSessionCookie(w http.ResponseWriter, u *UserSessionData, secret []byte) error {
+	return setSessionCookie(w, u, "", secret)
+}
+
+// SetSessionCookieWithKeyRing signs a versioned cookie with the currently
+// active key. A new key is selected automatically at each rotation boundary.
+func SetSessionCookieWithKeyRing(w http.ResponseWriter, u *UserSessionData, keys *RotatingKeyRing) error {
+	if keys == nil {
+		return errors.New("session key ring is nil")
+	}
+	keyID, key, err := keys.currentKey()
+	if err != nil {
+		return err
+	}
+	return setSessionCookie(w, u, keyID, key)
+}
+
+func setSessionCookie(w http.ResponseWriter, u *UserSessionData, keyID string, secret []byte) error {
+	if u == nil {
+		return errors.New("session data is nil")
+	}
+	if u.ExpiresAt <= time.Now().Unix() {
+		return errors.New("session expiration must be in the future")
+	}
 	// JSON encode
 	jsonData, err := json.Marshal(u)
 	if err != nil {
 		return err
 	}
 	// Base64 encode
-	value := base64.URLEncoding.EncodeToString(jsonData)
+	value := base64.RawURLEncoding.EncodeToString(jsonData)
 	// Sign
 	sig := computeHMAC(value, secret)
 	cookieValue := fmt.Sprintf("%s|%s", value, sig)
+	if keyID != "" {
+		cookieValue = fmt.Sprintf("%s|%s|%s|%s", rotatingCookieVersion, keyID, value, sig)
+	}
+	if len(cookieValue) > maxSessionCookieSize {
+		return errors.New("session cookie is too large")
+	}
 	var expires time.Time
 	if u.ExpiresAt > 0 {
 		expires = time.Unix(u.ExpiresAt, 0)
@@ -61,7 +90,7 @@ func SetSessionCookie(w http.ResponseWriter, u *UserSessionData, secret []byte) 
 		Value:       cookieValue,
 		Path:        "/",
 		Expires:     expires,
-		HttpOnly:    false,
+		HttpOnly:    true,
 		Secure:      true,
 		SameSite:    SameSite,
 		Partitioned: true,
