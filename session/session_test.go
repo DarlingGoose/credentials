@@ -26,10 +26,16 @@ func TestHMAC(t *testing.T) {
 func TestCookieRoundTrip(t *testing.T) {
 	secret := []byte("mysessionsecret")
 	u := &UserSessionData{
-		UserID:    "user123",
-		SignedIn:  true,
-		ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
-		Roles:     []string{"admin", "user"},
+		UserID:         "user123",
+		AccountID:      "account123",
+		Roles:          []string{"admin", "user"},
+		Scopes:         []string{"read", "write"},
+		SignedIn:       true,
+		ExpiresAt:      time.Now().Add(1 * time.Hour).Unix(),
+		AuthMethods:    []string{"password", "totp"},
+		SessionVersion: 2,
+		Issuer:         "https://issuer.example",
+		Audience:       []string{"app.example"},
 	}
 	// Set the cookie on a response recorder
 	rr := httptest.NewRecorder()
@@ -43,6 +49,9 @@ func TestCookieRoundTrip(t *testing.T) {
 	if len(cookies) == 0 {
 		t.Fatal("no cookie set")
 	}
+	if !cookies[0].HttpOnly {
+		t.Fatal("session cookie must be HttpOnly")
+	}
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(cookies[0])
 	got, err := GetSessionFromCookie(req, secret)
@@ -54,6 +63,15 @@ func TestCookieRoundTrip(t *testing.T) {
 	}
 	if !got.SignedIn {
 		t.Errorf("expected SignedIn true")
+	}
+	if got.IssuedAt == 0 || got.AuthTime == 0 || got.SessionID == "" {
+		t.Fatalf("missing generated session metadata: %#v", got)
+	}
+	if got.SessionVersion != 2 || got.Issuer != u.Issuer || len(got.Audience) != 1 || got.Audience[0] != u.Audience[0] {
+		t.Fatalf("session claims did not round trip: %#v", got)
+	}
+	if len(got.Scopes) != 2 || len(got.AuthMethods) != 2 {
+		t.Fatalf("session claims did not round trip: %#v", got)
 	}
 }
 

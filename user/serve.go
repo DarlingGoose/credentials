@@ -34,7 +34,10 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const totpChallengeExpiry = 5 * time.Minute // TOTP challenge lasts 5 minutes
+const (
+	totpChallengeExpiry = 5 * time.Minute // TOTP challenge lasts 5 minutes
+	defaultSessionTTL   = 7 * 24 * time.Hour
+)
 
 type totpChallengeData struct {
 	UserID    string
@@ -43,16 +46,47 @@ type totpChallengeData struct {
 type Server struct {
 	Store              Store
 	SessionSecret      []byte
+	SessionKeys        *session.RotatingKeyRing
 	WebAuthn           *webauthn.WebAuthn
 	redis              redis.Cmdable
 	rbac               *rbac.Manager
 	challengeStore     map[string]*webauthn.SessionData // In-memory store for WebAuthn challenges todo make this redis
 	totpChallengeStore map[string]totpChallengeData     // In-memory store for TOTP login challenges todo make this redis
 	RPName             string                           // Relying Party Name for TOTP provisioning
+	sessionIssuer      string
+	sessionAudience    []string
 }
 
 // NewServer creates a new Server instance.
 func NewServer(store Store, rbac *rbac.Manager, sessionSecret []byte, rpID, rpDisplayName string, rpOrigin ...string) (*Server, error) {
+	secretCopy := make([]byte, len(sessionSecret))
+	copy(secretCopy, sessionSecret)
+	return newServer(store, rbac, secretCopy, nil, rpID, rpDisplayName, rpOrigin...)
+}
+
+// NewServerWithKeyRing creates a user server with automatically rotating
+// session signing keys.
+func NewServerWithKeyRing(store Store, rbac *rbac.Manager, keys *session.RotatingKeyRing, rpID, rpDisplayName string, rpOrigin ...string) (*Server, error) {
+	if keys == nil {
+		return nil, errors.New("session key ring is nil")
+	}
+	if keys.VerificationGracePeriod() < defaultSessionTTL {
+		return nil, errors.New("session key verification grace period must be at least 7 days")
+	}
+	return newServer(store, rbac, nil, keys, rpID, rpDisplayName, rpOrigin...)
+}
+
+// NewAutoRotatingServer is a convenience constructor that retains old signing
+// keys for the server's seven-day session lifetime.
+func NewAutoRotatingServer(store Store, rbac *rbac.Manager, rootSecret []byte, rotationInterval time.Duration, rpID, rpDisplayName string, rpOrigin ...string) (*Server, error) {
+	keys, err := session.NewRotatingKeyRing(rootSecret, rotationInterval, defaultSessionTTL)
+	if err != nil {
+		return nil, err
+	}
+	return NewServerWithKeyRing(store, rbac, keys, rpID, rpDisplayName, rpOrigin...)
+}
+
+func newServer(store Store, rbac *rbac.Manager, sessionSecret []byte, keys *session.RotatingKeyRing, rpID, rpDisplayName string, rpOrigin ...string) (*Server, error) {
 	wv, err := webauthn.New(&webauthn.Config{
 		RPDisplayName: rpDisplayName, // Display Name for your site
 		RPID:          rpID,          // The origin for your site
@@ -65,14 +99,22 @@ func NewServer(store Store, rbac *rbac.Manager, sessionSecret []byte, rpID, rpDi
 		return nil, fmt.Errorf("failed to create webauthn instance: %w", err)
 	}
 
+	issuer := ""
+	if len(rpOrigin) > 0 {
+		issuer = rpOrigin[0]
+	}
+
 	return &Server{
 		Store:              store,
 		rbac:               rbac,
 		SessionSecret:      sessionSecret,
+		SessionKeys:        keys,
 		WebAuthn:           wv,
 		challengeStore:     make(map[string]*webauthn.SessionData), // Initialize WebAuthn challenge store
 		totpChallengeStore: make(map[string]totpChallengeData),     // Initialize TOTP challenge store
 		RPName:             rpDisplayName,                          // Use display name as RPName for TOTP
+		sessionIssuer:      issuer,
+		sessionAudience:    []string{rpID},
 	}, nil
 }
 func (s *Server) SetupRedis(cmdable redis.Cmdable) {
@@ -106,7 +148,7 @@ const userCtxKey ContextKey = "user"
 // AuthMiddleware checks for a valid session and attaches the User object to the request context.
 func (s *Server) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ses, err := session.GetSessionFromCookie(r, s.SessionSecret)
+		ses, err := s.getSessionFromCookie(r)
 		if err != nil || !ses.SignedIn {
 			log.Printf("Authentication failed: %v", err)
 			next.ServeHTTP(w, r)
@@ -120,11 +162,32 @@ func (s *Server) AuthMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if s.SessionKeys != nil {
+			// Re-sign on authenticated requests. This transparently upgrades legacy
+			// cookies and advances cookies signed by a retired rotation window.
+			if err := s.setSessionCookie(w, ses); err != nil {
+				log.Printf("Failed to refresh session cookie: %v", err)
+			}
+		}
 
 		// Attach user to context
 		ctx := context.WithValue(r.Context(), userCtxKey, user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func (s *Server) getSessionFromCookie(r *http.Request) (*session.UserSessionData, error) {
+	if s.SessionKeys != nil {
+		return session.GetSessionFromCookieWithKeyRing(r, s.SessionKeys)
+	}
+	return session.GetSessionFromCookie(r, s.SessionSecret)
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter, data *session.UserSessionData) error {
+	if s.SessionKeys != nil {
+		return session.SetSessionCookieWithKeyRing(w, data, s.SessionKeys)
+	}
+	return session.SetSessionCookie(w, data, s.SessionSecret)
 }
 
 // GetUserFromContext retrieves the User from the request context.
@@ -150,7 +213,7 @@ type RegisterRequest struct {
 //   - start with a letter
 //   - be 3–20 characters long
 //   - contain only letters, digits, or underscores
-var usernameRegex = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{1,19}$`)
+var usernameRegex = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{2,19}$`)
 
 // Password must:
 //   - be 8–64 characters long
@@ -253,13 +316,16 @@ func (s *Server) LoginPasswordHandler(w http.ResponseWriter, r *http.Request) {
 
 	// If no TOTP, set session cookie
 	sessionData := &session.UserSessionData{
-		UserID:    user.UserID(),
-		Roles:     user.Roles,
-		SignedIn:  true,
-		ExpiresAt: time.Now().Add(time.Hour * 24 * 7).Unix(),
-		Domain:    utils.GetDomain(r),
+		UserID:      user.UserID(),
+		Roles:       user.Roles,
+		SignedIn:    true,
+		ExpiresAt:   time.Now().Add(defaultSessionTTL).Unix(),
+		AuthMethods: []string{"password"},
+		Issuer:      s.sessionIssuer,
+		Audience:    s.sessionAudience,
+		Domain:      utils.GetDomain(r),
 	}
-	if err := session.SetSessionCookie(w, sessionData, s.SessionSecret); err != nil {
+	if err := s.setSessionCookie(w, sessionData); err != nil {
 		log.Printf("Error setting session cookie: %v", err)
 		writeError(w, http.StatusInternalServerError, "Failed to set session")
 		return
@@ -380,13 +446,16 @@ func (s *Server) LoginTOTPHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionData := &session.UserSessionData{
-		UserID:    user.UserID(),
-		Roles:     user.Roles,
-		SignedIn:  true,
-		ExpiresAt: time.Now().Add(time.Hour * 24 * 7).Unix(),
-		Domain:    utils.GetDomain(r),
+		UserID:      user.UserID(),
+		Roles:       user.Roles,
+		SignedIn:    true,
+		ExpiresAt:   time.Now().Add(defaultSessionTTL).Unix(),
+		AuthMethods: []string{"password", "totp"},
+		Issuer:      s.sessionIssuer,
+		Audience:    s.sessionAudience,
+		Domain:      utils.GetDomain(r),
 	}
-	if err := session.SetSessionCookie(w, sessionData, s.SessionSecret); err != nil {
+	if err := s.setSessionCookie(w, sessionData); err != nil {
 		log.Printf("Error setting session cookie after TOTP: %v", err)
 		writeError(w, http.StatusInternalServerError, "Failed to set session")
 		return
@@ -717,13 +786,16 @@ func (s *Server) FinishPasskeyLoginHandler(w http.ResponseWriter, r *http.Reques
 
 	// Set session cookie
 	sessionData := &session.UserSessionData{
-		UserID:    user.UserID(),
-		Roles:     user.Roles,
-		SignedIn:  true,
-		ExpiresAt: time.Now().Add(time.Hour * 24 * 7).Unix(),
-		Domain:    utils.GetDomain(r),
+		UserID:      user.UserID(),
+		Roles:       user.Roles,
+		SignedIn:    true,
+		ExpiresAt:   time.Now().Add(defaultSessionTTL).Unix(),
+		AuthMethods: []string{"passkey"},
+		Issuer:      s.sessionIssuer,
+		Audience:    s.sessionAudience,
+		Domain:      utils.GetDomain(r),
 	}
-	if err := session.SetSessionCookie(w, sessionData, s.SessionSecret); err != nil {
+	if err := s.setSessionCookie(w, sessionData); err != nil {
 		log.Printf("Error setting session cookie: %v", err)
 		writeError(w, http.StatusInternalServerError, "Failed to set session")
 		return
