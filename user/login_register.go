@@ -77,11 +77,14 @@ func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionData := &session.UserSessionData{
-		UserID:    user.UserID(),
-		Roles:     user.Roles,
-		SignedIn:  true,
-		ExpiresAt: time.Now().Add(defaultSessionTTL).Unix(),
-		Domain:    utils.GetDomain(r),
+		UserID:      user.UserID(),
+		Roles:       user.Roles,
+		SignedIn:    true,
+		ExpiresAt:   time.Now().Add(defaultSessionTTL).Unix(),
+		AuthMethods: []string{"password"},
+		Issuer:      s.sessionIssuer,
+		Audience:    s.sessionAudience,
+		Domain:      utils.GetDomain(r),
 	}
 	if err := s.setSessionCookie(w, sessionData); err != nil {
 		log.Printf("Error setting session cookie after TOTP: %v", err)

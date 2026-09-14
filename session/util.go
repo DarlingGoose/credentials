@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 var SameSite = http.SameSiteNoneMode
@@ -64,6 +66,16 @@ func setSessionCookie(w http.ResponseWriter, u *UserSessionData, keyID string, s
 	}
 	if u.ExpiresAt <= time.Now().Unix() {
 		return errors.New("session expiration must be in the future")
+	}
+	now := time.Now().Unix()
+	if u.IssuedAt == 0 {
+		u.IssuedAt = now
+	}
+	if u.SignedIn && u.AuthTime == 0 {
+		u.AuthTime = now
+	}
+	if u.SessionID == "" {
+		u.SessionID = uuid.NewString()
 	}
 	// JSON encode
 	jsonData, err := json.Marshal(u)

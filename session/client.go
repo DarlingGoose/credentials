@@ -88,13 +88,20 @@ func (c *Client) Authenticate(w http.ResponseWriter, r *http.Request) (*UserSess
 			Token: token,
 		})
 		if err == nil && info != nil && info.Active {
+			audience := []string(nil)
+			if info.ClientID != "" {
+				audience = []string{info.ClientID}
+			}
 			// build session
 			u = &UserSessionData{
 				UserID:         info.UserID,
 				AccountID:      info.AccountID,
+				Scopes:         strings.Fields(info.Scope),
 				SignedIn:       true,
 				ServiceAccount: strings.HasPrefix(info.UserID, "service-"),
 				ExpiresAt:      info.Exp,
+				AuthMethods:    []string{"bearer"},
+				Audience:       audience,
 				Domain:         utils.GetDomain(r),
 			}
 			// load roles

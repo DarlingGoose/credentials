@@ -53,6 +53,8 @@ type Server struct {
 	challengeStore     map[string]*webauthn.SessionData // In-memory store for WebAuthn challenges todo make this redis
 	totpChallengeStore map[string]totpChallengeData     // In-memory store for TOTP login challenges todo make this redis
 	RPName             string                           // Relying Party Name for TOTP provisioning
+	sessionIssuer      string
+	sessionAudience    []string
 }
 
 // NewServer creates a new Server instance.
@@ -97,6 +99,11 @@ func newServer(store Store, rbac *rbac.Manager, sessionSecret []byte, keys *sess
 		return nil, fmt.Errorf("failed to create webauthn instance: %w", err)
 	}
 
+	issuer := ""
+	if len(rpOrigin) > 0 {
+		issuer = rpOrigin[0]
+	}
+
 	return &Server{
 		Store:              store,
 		rbac:               rbac,
@@ -106,6 +113,8 @@ func newServer(store Store, rbac *rbac.Manager, sessionSecret []byte, keys *sess
 		challengeStore:     make(map[string]*webauthn.SessionData), // Initialize WebAuthn challenge store
 		totpChallengeStore: make(map[string]totpChallengeData),     // Initialize TOTP challenge store
 		RPName:             rpDisplayName,                          // Use display name as RPName for TOTP
+		sessionIssuer:      issuer,
+		sessionAudience:    []string{rpID},
 	}, nil
 }
 func (s *Server) SetupRedis(cmdable redis.Cmdable) {
@@ -307,11 +316,14 @@ func (s *Server) LoginPasswordHandler(w http.ResponseWriter, r *http.Request) {
 
 	// If no TOTP, set session cookie
 	sessionData := &session.UserSessionData{
-		UserID:    user.UserID(),
-		Roles:     user.Roles,
-		SignedIn:  true,
-		ExpiresAt: time.Now().Add(defaultSessionTTL).Unix(),
-		Domain:    utils.GetDomain(r),
+		UserID:      user.UserID(),
+		Roles:       user.Roles,
+		SignedIn:    true,
+		ExpiresAt:   time.Now().Add(defaultSessionTTL).Unix(),
+		AuthMethods: []string{"password"},
+		Issuer:      s.sessionIssuer,
+		Audience:    s.sessionAudience,
+		Domain:      utils.GetDomain(r),
 	}
 	if err := s.setSessionCookie(w, sessionData); err != nil {
 		log.Printf("Error setting session cookie: %v", err)
@@ -434,11 +446,14 @@ func (s *Server) LoginTOTPHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionData := &session.UserSessionData{
-		UserID:    user.UserID(),
-		Roles:     user.Roles,
-		SignedIn:  true,
-		ExpiresAt: time.Now().Add(defaultSessionTTL).Unix(),
-		Domain:    utils.GetDomain(r),
+		UserID:      user.UserID(),
+		Roles:       user.Roles,
+		SignedIn:    true,
+		ExpiresAt:   time.Now().Add(defaultSessionTTL).Unix(),
+		AuthMethods: []string{"password", "totp"},
+		Issuer:      s.sessionIssuer,
+		Audience:    s.sessionAudience,
+		Domain:      utils.GetDomain(r),
 	}
 	if err := s.setSessionCookie(w, sessionData); err != nil {
 		log.Printf("Error setting session cookie after TOTP: %v", err)
@@ -771,11 +786,14 @@ func (s *Server) FinishPasskeyLoginHandler(w http.ResponseWriter, r *http.Reques
 
 	// Set session cookie
 	sessionData := &session.UserSessionData{
-		UserID:    user.UserID(),
-		Roles:     user.Roles,
-		SignedIn:  true,
-		ExpiresAt: time.Now().Add(defaultSessionTTL).Unix(),
-		Domain:    utils.GetDomain(r),
+		UserID:      user.UserID(),
+		Roles:       user.Roles,
+		SignedIn:    true,
+		ExpiresAt:   time.Now().Add(defaultSessionTTL).Unix(),
+		AuthMethods: []string{"passkey"},
+		Issuer:      s.sessionIssuer,
+		Audience:    s.sessionAudience,
+		Domain:      utils.GetDomain(r),
 	}
 	if err := s.setSessionCookie(w, sessionData); err != nil {
 		log.Printf("Error setting session cookie: %v", err)

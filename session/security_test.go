@@ -135,7 +135,7 @@ func TestAuthenticateActiveBearerToken(t *testing.T) {
 			if req.Token != "access-token" {
 				t.Fatalf("token = %q", req.Token)
 			}
-			return &oserver.IntrospectResponse{Active: true, UserID: "service-example", AccountID: "account-1", Exp: expires}, nil
+			return &oserver.IntrospectResponse{Active: true, UserID: "service-example", AccountID: "account-1", ClientID: "client-1", Scope: "read write", Exp: expires}, nil
 		},
 	}
 	client := NewClient(oauth, nil, []byte("static-secret"), time.Hour)
@@ -149,6 +149,15 @@ func TestAuthenticateActiveBearerToken(t *testing.T) {
 	}
 	if !got.SignedIn || !got.ServiceAccount || got.AccountID != "account-1" {
 		t.Fatalf("unexpected session: %#v", got)
+	}
+	if got.IssuedAt == 0 || got.AuthTime == 0 || got.SessionID == "" {
+		t.Fatalf("missing session metadata: %#v", got)
+	}
+	if len(got.Scopes) != 2 || got.Scopes[0] != "read" || got.Scopes[1] != "write" {
+		t.Fatalf("scopes = %#v", got.Scopes)
+	}
+	if len(got.Audience) != 1 || got.Audience[0] != "client-1" {
+		t.Fatalf("audience = %#v", got.Audience)
 	}
 	fromContext, err := GetSession(ctx)
 	if err != nil || fromContext.UserID != got.UserID {
