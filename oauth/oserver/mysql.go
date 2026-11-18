@@ -54,9 +54,9 @@ func (s *MySQLServer) ensureSchema(ctx context.Context) error {
 
 		`CREATE TABLE IF NOT EXISTS oserver.oauth_tokens (
 			id BIGINT AUTO_INCREMENT PRIMARY KEY,
-			code TEXT UNIQUE,
-			access_token TEXT UNIQUE,
-			refresh_token TEXT UNIQUE,
+			code VARCHAR(43) UNIQUE,
+			access_token VARCHAR(43) UNIQUE,
+			refresh_token VARCHAR(43) UNIQUE,
 			client_id VARCHAR(36) NOT NULL,
 			user_id TEXT,
 			account_id TEXT,
@@ -67,6 +67,22 @@ func (s *MySQLServer) ensureSchema(ctx context.Context) error {
 			code_challenge_method TEXT,
 			expires_at BIGINT,
 			created_at BIGINT
+		)`,
+
+		`ALTER TABLE oserver.oauth_tokens
+			MODIFY COLUMN code VARCHAR(43) NULL,
+			MODIFY COLUMN access_token VARCHAR(43) NULL,
+			MODIFY COLUMN refresh_token VARCHAR(43) NULL`,
+
+		`CREATE TABLE IF NOT EXISTS oserver.oauth_refresh_tokens (
+			token_hash VARCHAR(43) PRIMARY KEY,
+			family_id VARCHAR(43) NOT NULL,
+			client_id VARCHAR(36) NOT NULL,
+			generation BIGINT NOT NULL,
+			consumed_at BIGINT NOT NULL DEFAULT 0,
+			revoked_at BIGINT NOT NULL DEFAULT 0,
+			created_at BIGINT NOT NULL,
+			INDEX refresh_family_idx (family_id)
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS oserver.oauth_jwks (
@@ -110,6 +126,9 @@ func generateSecretMySQL(n int) (string, error) {
 func (s *MySQLServer) RegisterClient(ctx context.Context, client *OAuthClient) (*OAuthClient, error) {
 	if len(client.GrantTypes) == 0 {
 		client.GrantTypes = []string{"client_credentials"}
+	}
+	if client.TokenEndpointAuth == "" {
+		client.TokenEndpointAuth = "client_secret_post"
 	}
 	if len(client.RedirectURIs) == 0 {
 		return nil, fmt.Errorf("no redirect_uris provided")
@@ -174,10 +193,18 @@ func (s *MySQLServer) GetClient(ctx context.Context, clientID string) (*OAuthCli
 		return nil, err
 	}
 
-	json.Unmarshal(redirects, &c.RedirectURIs)
-	json.Unmarshal(scopes, &c.Scopes)
-	json.Unmarshal(grants, &c.GrantTypes)
-	json.Unmarshal(respTypes, &c.ResponseTypes)
+	if err := json.Unmarshal(redirects, &c.RedirectURIs); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(scopes, &c.Scopes); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(grants, &c.GrantTypes); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(respTypes, &c.ResponseTypes); err != nil {
+		return nil, err
+	}
 
 	return &c, nil
 }
@@ -200,7 +227,7 @@ func (s *MySQLServer) ListClients(ctx context.Context, accountID string) ([]*OAu
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var list []*OAuthClient
 	for rows.Next() {
@@ -219,10 +246,18 @@ func (s *MySQLServer) ListClients(ctx context.Context, accountID string) ([]*OAu
 			return nil, err
 		}
 
-		json.Unmarshal(redirects, &c.RedirectURIs)
-		json.Unmarshal(scopes, &c.Scopes)
-		json.Unmarshal(grants, &c.GrantTypes)
-		json.Unmarshal(respTypes, &c.ResponseTypes)
+		if err := json.Unmarshal(redirects, &c.RedirectURIs); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(scopes, &c.Scopes); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(grants, &c.GrantTypes); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(respTypes, &c.ResponseTypes); err != nil {
+			return nil, err
+		}
 
 		list = append(list, &c)
 	}
@@ -284,28 +319,27 @@ func (s *MySQLServer) DeleteClient(ctx context.Context, clientID string) error {
 // Authorization code
 // --------------------------------------------------------------------------
 
-func (s *MySQLServer) Authorize(ctx context.Context, req AuthRequest) (*AuthResponse, error) {
-	meta := make(map[string]string)
-	if req.State != "" {
-		if d, err := base64.StdEncoding.DecodeString(req.State); err == nil {
-			_ = json.Unmarshal(d, &meta)
-		}
+func (s *MySQLServer) Authorize(ctx context.Context, principal AuthorizationPrincipal, req AuthRequest) (*AuthResponse, error) {
+	if err := validateAuthorizationPrincipal(principal); err != nil {
+		return nil, err
+	}
+	if _, err := ValidateAuthorizationRequest(ctx, s, req); err != nil {
+		return nil, err
+	}
+	code, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
 	}
 
-	userID := meta["user_id"]
-	accountID := meta["account_id"]
-
-	code := uuid.New().String()
-
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO oserver.oauth_tokens
 		(code, client_id, user_id, account_id, redirect_uri, scope,
 		 code_challenge, code_challenge_method, grant_type, created_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		code,
+		hashOpaqueToken(code),
 		req.ClientID,
-		userID,
-		accountID,
+		principal.UserID,
+		principal.AccountID,
 		req.RedirectURI,
 		req.Scope,
 		req.CodeChallenge,
@@ -336,18 +370,28 @@ func (s *MySQLServer) Token(ctx context.Context, req TokenRequest) (*TokenRespon
 }
 
 func (s *MySQLServer) tokenFromCode(ctx context.Context, req TokenRequest, now time.Time) (*TokenResponse, error) {
+	if err := validateTokenClient(ctx, s, req); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var (
 		clientID            string
 		redirectURI         string
 		scope               string
 		codeChallenge       string
 		codeChallengeMethod string
+		createdAt           int64
 	)
 
-	err := s.db.QueryRowContext(ctx, `
-		SELECT client_id, redirect_uri, scope, code_challenge, code_challenge_method
-		FROM oserver.oauth_tokens WHERE code = ?`, req.Code).
-		Scan(&clientID, &redirectURI, &scope, &codeChallenge, &codeChallengeMethod)
+	codeHash := hashOpaqueToken(req.Code)
+	err = tx.QueryRowContext(ctx, `
+		SELECT client_id, redirect_uri, scope, code_challenge, code_challenge_method, created_at
+		FROM oserver.oauth_tokens WHERE code = ? FOR UPDATE`, codeHash).
+		Scan(&clientID, &redirectURI, &scope, &codeChallenge, &codeChallengeMethod, &createdAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, errors.New("invalid authorization code")
@@ -359,33 +403,52 @@ func (s *MySQLServer) tokenFromCode(ctx context.Context, req TokenRequest, now t
 	if redirectURI != req.RedirectURI {
 		return nil, errors.New("redirect_uri mismatch")
 	}
-
-	if codeChallenge != "" {
-		switch codeChallengeMethod {
-		case "S256":
-			if !ValidateCodeChallenge(req.CodeVerifier, codeChallenge) {
-				return nil, errors.New("invalid code_verifier")
-			}
-		case "plain":
-			if req.CodeVerifier != codeChallenge {
-				return nil, errors.New("invalid code_verifier")
-			}
-		default:
-			return nil, errors.New("unsupported code_challenge_method")
-		}
+	if clientID != req.ClientID {
+		return nil, errors.New("authorization code client mismatch")
+	}
+	if createdAt <= 0 || now.After(time.Unix(createdAt, 0).Add(authorizationCodeTTL)) {
+		return nil, errors.New("authorization code expired")
 	}
 
-	accessToken := uuid.New().String()
-	refreshToken := uuid.New().String()
-	expiresAt := now.Add(time.Hour).Unix()
+	if codeChallengeMethod != "S256" || codeChallenge == "" || !ValidateCodeChallenge(req.CodeVerifier, codeChallenge) {
+		return nil, errors.New("invalid code_verifier")
+	}
 
-	_, err = s.db.ExecContext(ctx, `
+	accessToken, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
+	refreshToken, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
+	expiresAt := now.Add(time.Hour).Unix()
+	familyID, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := tx.ExecContext(ctx, `
 		UPDATE oserver.oauth_tokens
-		SET access_token=?, refresh_token=?, expires_at=?
-		WHERE code=?`,
-		accessToken, refreshToken, expiresAt, req.Code,
+		SET code=NULL, access_token=?, refresh_token=?, expires_at=?
+		WHERE code=? AND client_id=?`,
+		hashOpaqueToken(accessToken), hashOpaqueToken(refreshToken), expiresAt, codeHash, req.ClientID,
 	)
 	if err != nil {
+		return nil, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return nil, errors.New("authorization code already consumed")
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO oserver.oauth_refresh_tokens
+		(token_hash, family_id, client_id, generation, created_at)
+		VALUES (?,?,?,?,?)`,
+		hashOpaqueToken(refreshToken), familyID, req.ClientID, 0, now.Unix()); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -399,30 +462,103 @@ func (s *MySQLServer) tokenFromCode(ctx context.Context, req TokenRequest, now t
 }
 
 func (s *MySQLServer) tokenFromRefresh(ctx context.Context, req TokenRequest, now time.Time) (*TokenResponse, error) {
-	var (
-		clientID string
-		scope    string
-	)
-
-	err := s.db.QueryRowContext(ctx,
-		`SELECT client_id, scope FROM oserver.oauth_tokens WHERE refresh_token = ?`, req.RefreshToken).
-		Scan(&clientID, &scope)
-
+	if err := validateTokenClient(ctx, s, req); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	refreshHash := hashOpaqueToken(req.RefreshToken)
+	var familyID, clientID string
+	var generation, consumedAt, revokedAt int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT family_id, client_id, generation, consumed_at, revoked_at
+		FROM oserver.oauth_refresh_tokens WHERE token_hash = ? FOR UPDATE`, refreshHash).
+		Scan(&familyID, &clientID, &generation, &consumedAt, &revokedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, errors.New("invalid refresh token")
 	}
 	if err != nil {
 		return nil, err
 	}
+	if clientID != req.ClientID {
+		return nil, errors.New("refresh token client mismatch")
+	}
+	if revokedAt != 0 {
+		return nil, errors.New("refresh token family revoked")
+	}
+	if consumedAt != 0 {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE oserver.oauth_refresh_tokens SET revoked_at = ?
+			WHERE family_id = ? AND revoked_at = 0`, now.Unix(), familyID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE oserver.oauth_tokens SET access_token = NULL, refresh_token = NULL, expires_at = 0
+			WHERE refresh_token IN (
+				SELECT token_hash FROM oserver.oauth_refresh_tokens
+				WHERE family_id = ? AND consumed_at = 0
+			)`, familyID); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("refresh token reuse detected")
+	}
 
-	accessToken := uuid.New().String()
+	var scope string
+	err = tx.QueryRowContext(ctx, `
+		SELECT scope FROM oserver.oauth_tokens
+		WHERE refresh_token = ? AND client_id = ? FOR UPDATE`, refreshHash, req.ClientID).Scan(&scope)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("refresh token is not current")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	accessToken, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
+	refreshToken, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
 	expiresAt := now.Add(time.Hour).Unix()
+	newRefreshHash := hashOpaqueToken(refreshToken)
 
-	_, err = s.db.ExecContext(ctx,
-		`UPDATE oserver.oauth_tokens SET access_token=?, expires_at=? WHERE refresh_token=?`,
-		accessToken, expiresAt, req.RefreshToken,
+	result, err := tx.ExecContext(ctx,
+		`UPDATE oserver.oauth_tokens SET access_token=?, refresh_token=?, expires_at=? WHERE refresh_token=? AND client_id=?`,
+		hashOpaqueToken(accessToken), newRefreshHash, expiresAt, refreshHash, req.ClientID,
 	)
 	if err != nil {
+		return nil, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return nil, errors.New("refresh token already used")
+	}
+	result, err = tx.ExecContext(ctx, `
+		UPDATE oserver.oauth_refresh_tokens SET consumed_at = ?
+		WHERE token_hash = ? AND consumed_at = 0 AND revoked_at = 0`, now.Unix(), refreshHash)
+	if err != nil {
+		return nil, err
+	}
+	rows, err = result.RowsAffected()
+	if err != nil || rows != 1 {
+		return nil, errors.New("refresh token already used")
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO oserver.oauth_refresh_tokens
+		(token_hash, family_id, client_id, generation, created_at)
+		VALUES (?,?,?,?,?)`, newRefreshHash, familyID, req.ClientID, generation+1, now.Unix()); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -430,7 +566,7 @@ func (s *MySQLServer) tokenFromRefresh(ctx context.Context, req TokenRequest, no
 		AccessToken:  accessToken,
 		TokenType:    "Bearer",
 		ExpiresIn:    int64(time.Hour.Seconds()),
-		RefreshToken: req.RefreshToken,
+		RefreshToken: refreshToken,
 		Scope:        scope,
 	}, nil
 }
@@ -456,8 +592,12 @@ func (s *MySQLServer) tokenFromClientCredentials(ctx context.Context, req TokenR
 		return nil, err
 	}
 
-	json.Unmarshal(scopesJSON, &scopes)
-	json.Unmarshal(grantsJSON, &grants)
+	if err := json.Unmarshal(scopesJSON, &scopes); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(grantsJSON, &grants); err != nil {
+		return nil, err
+	}
 
 	if clientSecret != req.ClientSecret {
 		return nil, errors.New("invalid client credentials")
@@ -474,7 +614,10 @@ func (s *MySQLServer) tokenFromClientCredentials(ctx context.Context, req TokenR
 		return nil, errors.New("grant_type not allowed")
 	}
 
-	accessToken := uuid.New().String()
+	accessToken, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
 	expiresAt := now.Add(time.Hour).Unix()
 	scopeStr := strings.Join(scopes, " ")
 
@@ -482,7 +625,7 @@ func (s *MySQLServer) tokenFromClientCredentials(ctx context.Context, req TokenR
 		INSERT INTO oserver.oauth_tokens
 		(access_token, client_id, scope, grant_type, expires_at, created_at)
 		VALUES (?,?,?,?,?,?)`,
-		accessToken, req.ClientID, scopeStr, "client_credentials", expiresAt, now.Unix(),
+		hashOpaqueToken(accessToken), req.ClientID, scopeStr, "client_credentials", expiresAt, now.Unix(),
 	)
 	if err != nil {
 		return nil, err
@@ -496,9 +639,10 @@ func (s *MySQLServer) tokenFromClientCredentials(ctx context.Context, req TokenR
 	}, nil
 }
 func (s *MySQLServer) Revoke(ctx context.Context, req RevocationRequest) error {
+	tokenHash := hashOpaqueToken(req.Token)
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM oauth_tokens WHERE access_token = ? OR refresh_token = ?`,
-		req.Token, req.Token,
+		tokenHash, tokenHash,
 	)
 	return err
 }
@@ -514,7 +658,7 @@ func (s *MySQLServer) Introspect(ctx context.Context, req IntrospectRequest) (*I
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT client_id, user_id, account_id, scope, expires_at
-		FROM oserver.oauth_tokens WHERE access_token = ?`, req.Token).
+		FROM oserver.oauth_tokens WHERE access_token = ?`, hashOpaqueToken(req.Token)).
 		Scan(&clientID, &userID, &accountID, &scope, &expiresAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -539,7 +683,7 @@ func (s *MySQLServer) JWKs(ctx context.Context) (*JWKSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var keys []json.RawMessage
 	for rows.Next() {
@@ -562,7 +706,7 @@ func (s *MySQLServer) SetClientImage(r *http.Request, clientID string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	data, err := io.ReadAll(file)
 	if err != nil {
@@ -628,7 +772,7 @@ func (s *MySQLServer) HasAccess(
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT user_id, account_id, scope, expires_at
-		FROM oserver.oauth_tokens WHERE access_token = ?`, token).
+		FROM oserver.oauth_tokens WHERE access_token = ?`, hashOpaqueToken(token)).
 		Scan(&userID, &accountID, &scope, &expiresAt)
 
 	if errors.Is(err, sql.ErrNoRows) {

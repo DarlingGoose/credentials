@@ -49,6 +49,14 @@ type AuthRequest struct {
 	CodeChallenge       string `json:"code_challenge,omitempty"`        // PKCE
 	CodeChallengeMethod string `json:"code_challenge_method,omitempty"` // "S256" or "plain"
 }
+
+// AuthorizationPrincipal is the authenticated resource owner authorizing a
+// client. It must be derived from trusted server-side authentication, never
+// from OAuth state, headers, redirect parameters, or consent form fields.
+type AuthorizationPrincipal struct {
+	UserID    string `json:"user_id"`
+	AccountID string `json:"account_id,omitempty"`
+}
 type AuthResponse struct {
 	Code  string `json:"code"`
 	State string `json:"state,omitempty"`
@@ -56,13 +64,14 @@ type AuthResponse struct {
 
 // /token
 type TokenRequest struct {
-	GrantType    string `json:"grant_type"` // "authorization_code", "refresh_token", "client_credentials"
-	Code         string `json:"code,omitempty"`
-	RedirectURI  string `json:"redirect_uri,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
-	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE
+	GrantType        string `json:"grant_type"` // "authorization_code", "refresh_token", "client_credentials"
+	Code             string `json:"code,omitempty"`
+	RedirectURI      string `json:"redirect_uri,omitempty"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
+	ClientID         string `json:"client_id"`
+	ClientSecret     string `json:"client_secret"`
+	CodeVerifier     string `json:"code_verifier,omitempty"` // PKCE
+	ClientAuthMethod string `json:"-"`
 }
 type TokenResponse struct {
 	AccessToken  string `json:"access_token"`

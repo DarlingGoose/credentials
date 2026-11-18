@@ -32,7 +32,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           # Specify the Go version. You can change this to your desired version.
-          go-version: '1.22'
+          go-version: '1.26'
           # Enable caching of Go modules to speed up subsequent runs.
           cache: true
 
@@ -53,11 +53,9 @@ jobs:
       # You'll need to add a '.golangci.yml' config file in your repo for this to work effectively.
       # Install golangci-lint - Removed explicit version to let the installer pick the latest compatible version.
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6 # Use the latest stable version
+        uses: golangci/golangci-lint-action@v9
         with:
-          # Optional: specify a specific version of golangci-lint to use.
-          # If not specified, the action will try to determine the latest compatible version.
-          # version: v1.59.1 # Uncomment and change if you need a specific version
+          version: v2.15.0
 
           # Optional: specify the path to the .golangci.yml config file.
           # config: path/to/.golangci.yml
@@ -92,7 +90,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.26'
 
       # Modified: Using a shell script to get the next semantic version
       - name: Get next semantic version

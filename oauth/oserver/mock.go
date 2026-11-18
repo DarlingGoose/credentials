@@ -7,7 +7,7 @@ import (
 
 // MockOServer provides customizable hooks for testing OServer behavior.
 type MockOServer struct {
-	AuthorizeFunc       func(ctx context.Context, req AuthRequest) (*AuthResponse, error)
+	AuthorizeFunc       func(ctx context.Context, principal AuthorizationPrincipal, req AuthRequest) (*AuthResponse, error)
 	TokenFunc           func(ctx context.Context, req TokenRequest) (*TokenResponse, error)
 	RevokeFunc          func(ctx context.Context, req RevocationRequest) error
 	IntrospectFunc      func(ctx context.Context, req IntrospectRequest) (*IntrospectResponse, error)
@@ -26,9 +26,9 @@ type MockOServer struct {
 var _ OServer = (*MockOServer)(nil)
 
 // Authorize calls AuthorizeFunc if set, otherwise returns nil, nil
-func (m *MockOServer) Authorize(ctx context.Context, req AuthRequest) (*AuthResponse, error) {
+func (m *MockOServer) Authorize(ctx context.Context, principal AuthorizationPrincipal, req AuthRequest) (*AuthResponse, error) {
 	if m.AuthorizeFunc != nil {
-		return m.AuthorizeFunc(ctx, req)
+		return m.AuthorizeFunc(ctx, principal, req)
 	}
 	return nil, nil
 }

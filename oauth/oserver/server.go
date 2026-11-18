@@ -7,7 +7,7 @@ import (
 
 type OServer interface {
 	// --- OAuth2 endpoints ---
-	Authorize(ctx context.Context, req AuthRequest) (*AuthResponse, error)
+	Authorize(ctx context.Context, principal AuthorizationPrincipal, req AuthRequest) (*AuthResponse, error)
 	Token(ctx context.Context, req TokenRequest) (*TokenResponse, error)
 	Revoke(ctx context.Context, req RevocationRequest) error
 	Introspect(ctx context.Context, req IntrospectRequest) (*IntrospectResponse, error)
