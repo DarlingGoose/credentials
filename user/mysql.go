@@ -43,7 +43,7 @@ func (s *MySQLStore) ensureSchema(ctx context.Context) error {
 		return err
 	}
 	// Defer a rollback. If Commit() is called, this does nothing.
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS users (
@@ -400,7 +400,7 @@ func (s *MySQLStore) queryPasskeys(ctx context.Context, query string, arg interf
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []WebAuthnCredential
 	for rows.Next() {

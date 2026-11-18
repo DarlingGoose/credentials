@@ -98,8 +98,11 @@ func validateProvider(provider Provider) error {
 		return fmt.Errorf("provider login: issuer for %q must be an absolute HTTPS URL", provider.Name)
 	}
 	redirect, err := url.Parse(provider.RedirectURL)
-	if err != nil || redirect.User != nil || redirect.Host == "" ||
-		(redirect.Scheme != "https" && !((redirect.Hostname() == "localhost" || redirect.Hostname() == "127.0.0.1") && redirect.Scheme == "http")) {
+	if err != nil {
+		return fmt.Errorf("provider login: redirect URL for %q must use HTTPS", provider.Name)
+	}
+	loopbackHTTP := redirect.Scheme == "http" && (redirect.Hostname() == "localhost" || redirect.Hostname() == "127.0.0.1")
+	if redirect.User != nil || redirect.Host == "" || (redirect.Scheme != "https" && !loopbackHTTP) {
 		return fmt.Errorf("provider login: redirect URL for %q must use HTTPS", provider.Name)
 	}
 	return nil
@@ -274,7 +277,7 @@ func (m *Manager) getJSON(ctx context.Context, endpoint string, destination any)
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return fmt.Errorf("unexpected HTTP status %d", response.StatusCode)
 	}
@@ -388,9 +391,16 @@ func (key jsonWebKey) publicKey() (any, error) {
 		}
 		return &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: exponent}, nil
 	case "EC":
-		curves := map[string]elliptic.Curve{"P-256": elliptic.P256(), "P-384": elliptic.P384(), "P-521": elliptic.P521()}
-		curve := curves[key.Crv]
-		if curve == nil {
+		curves := map[string]struct {
+			curve elliptic.Curve
+			size  int
+		}{
+			"P-256": {curve: elliptic.P256(), size: 32},
+			"P-384": {curve: elliptic.P384(), size: 48},
+			"P-521": {curve: elliptic.P521(), size: 66},
+		}
+		curve, ok := curves[key.Crv]
+		if !ok {
 			return nil, errors.New("unsupported EC curve")
 		}
 		x, err := decode(key.X)
@@ -401,8 +411,15 @@ func (key jsonWebKey) publicKey() (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		public := &ecdsa.PublicKey{Curve: curve, X: new(big.Int).SetBytes(x), Y: new(big.Int).SetBytes(y)}
-		if !curve.IsOnCurve(public.X, public.Y) {
+		if len(x) == 0 || len(x) > curve.size || len(y) == 0 || len(y) > curve.size {
+			return nil, errors.New("invalid EC point")
+		}
+		encoded := make([]byte, 1+2*curve.size)
+		encoded[0] = 4
+		copy(encoded[1+curve.size-len(x):1+curve.size], x)
+		copy(encoded[1+2*curve.size-len(y):], y)
+		public, err := ecdsa.ParseUncompressedPublicKey(curve.curve, encoded)
+		if err != nil {
 			return nil, errors.New("invalid EC point")
 		}
 		return public, nil

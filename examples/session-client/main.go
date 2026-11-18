@@ -38,7 +38,7 @@ func main() {
 			http.Error(w, "session unavailable", http.StatusInternalServerError)
 			return
 		}
-		fmt.Fprintf(w, "session user: %s; signed in: %t\n", current.UserID, current.SignedIn)
+		_, _ = fmt.Fprintf(w, "session user: %s; signed in: %t\n", current.UserID, current.SignedIn)
 	})
 
 	server := &http.Server{

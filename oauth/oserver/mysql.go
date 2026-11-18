@@ -193,10 +193,18 @@ func (s *MySQLServer) GetClient(ctx context.Context, clientID string) (*OAuthCli
 		return nil, err
 	}
 
-	json.Unmarshal(redirects, &c.RedirectURIs)
-	json.Unmarshal(scopes, &c.Scopes)
-	json.Unmarshal(grants, &c.GrantTypes)
-	json.Unmarshal(respTypes, &c.ResponseTypes)
+	if err := json.Unmarshal(redirects, &c.RedirectURIs); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(scopes, &c.Scopes); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(grants, &c.GrantTypes); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(respTypes, &c.ResponseTypes); err != nil {
+		return nil, err
+	}
 
 	return &c, nil
 }
@@ -219,7 +227,7 @@ func (s *MySQLServer) ListClients(ctx context.Context, accountID string) ([]*OAu
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var list []*OAuthClient
 	for rows.Next() {
@@ -238,10 +246,18 @@ func (s *MySQLServer) ListClients(ctx context.Context, accountID string) ([]*OAu
 			return nil, err
 		}
 
-		json.Unmarshal(redirects, &c.RedirectURIs)
-		json.Unmarshal(scopes, &c.Scopes)
-		json.Unmarshal(grants, &c.GrantTypes)
-		json.Unmarshal(respTypes, &c.ResponseTypes)
+		if err := json.Unmarshal(redirects, &c.RedirectURIs); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(scopes, &c.Scopes); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(grants, &c.GrantTypes); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(respTypes, &c.ResponseTypes); err != nil {
+			return nil, err
+		}
 
 		list = append(list, &c)
 	}
@@ -361,7 +377,7 @@ func (s *MySQLServer) tokenFromCode(ctx context.Context, req TokenRequest, now t
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var (
 		clientID            string
 		redirectURI         string
@@ -576,8 +592,12 @@ func (s *MySQLServer) tokenFromClientCredentials(ctx context.Context, req TokenR
 		return nil, err
 	}
 
-	json.Unmarshal(scopesJSON, &scopes)
-	json.Unmarshal(grantsJSON, &grants)
+	if err := json.Unmarshal(scopesJSON, &scopes); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(grantsJSON, &grants); err != nil {
+		return nil, err
+	}
 
 	if clientSecret != req.ClientSecret {
 		return nil, errors.New("invalid client credentials")
@@ -663,7 +683,7 @@ func (s *MySQLServer) JWKs(ctx context.Context) (*JWKSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var keys []json.RawMessage
 	for rows.Next() {
@@ -686,7 +706,7 @@ func (s *MySQLServer) SetClientImage(r *http.Request, clientID string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	data, err := io.ReadAll(file)
 	if err != nil {

@@ -106,7 +106,7 @@ func newTestProvider(t *testing.T) *testProvider {
 		})
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
-		n := base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.N.Bytes())
+		n := base64.RawURLEncoding.EncodeToString(privateKey.N.Bytes())
 		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
 			"kid": "test-key", "kty": "RSA", "alg": "RS256", "n": n, "e": "AQAB",
 		}}})

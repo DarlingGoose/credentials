@@ -71,7 +71,7 @@ func (s *MySQLStore) ConsumeAttempt(ctx context.Context, stateHash []byte, now t
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var attempt LoginAttempt
 	var expires time.Time
@@ -118,7 +118,7 @@ func (s *MySQLStore) LinkIdentity(ctx context.Context, identity ExternalIdentity
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	key := externalIdentityKey(identity.Issuer, identity.Subject)
 
 	var existingIssuer, existingSubject, existingUser string
