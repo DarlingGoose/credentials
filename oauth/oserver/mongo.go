@@ -77,6 +77,9 @@ func (s *MongoServer) RegisterClient(ctx context.Context, client *OAuthClient) (
 	if len(client.GrantTypes) == 0 {
 		client.GrantTypes = []string{"client_credentials"}
 	}
+	if client.TokenEndpointAuth == "" {
+		client.TokenEndpointAuth = "client_secret_post"
+	}
 	if len(client.RedirectURIs) == 0 {
 		return nil, fmt.Errorf("no redirect_uris provided")
 	}
@@ -214,25 +217,20 @@ func (s *MongoServer) DeleteClient(ctx context.Context, clientID string) error {
 }
 
 // Authorize issues an authorization code and stores it in tokens collection.
-func (s *MongoServer) Authorize(ctx context.Context, req AuthRequest) (*AuthResponse, error) {
-	// Validate client, redirect URI, scope...
-	// generate code
-	meta := make(map[string]interface{})
-	if req.State != "" {
-		d, err := base64.StdEncoding.DecodeString(req.State)
-		if err == nil {
-			err = json.Unmarshal([]byte(d), &meta)
-			if err == nil {
-				slog.Error("failed unmarshal state", slog.String("state", req.State))
-			}
-		} else {
-			slog.Error("failed decode state", slog.String("state", req.State))
-		}
-	}
 
-	code := primitive.NewObjectID().Hex()
+func (s *MongoServer) Authorize(ctx context.Context, principal AuthorizationPrincipal, req AuthRequest) (*AuthResponse, error) {
+	if err := validateAuthorizationPrincipal(principal); err != nil {
+		return nil, err
+	}
+	if _, err := ValidateAuthorizationRequest(ctx, s, req); err != nil {
+		return nil, err
+	}
+	code, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
 	rec := bson.M{
-		"code":                  code,
+		"code":                  hashOpaqueToken(code),
 		"client_id":             req.ClientID,
 		"redirect_uri":          req.RedirectURI,
 		"scope":                 req.Scope,
@@ -240,11 +238,10 @@ func (s *MongoServer) Authorize(ctx context.Context, req AuthRequest) (*AuthResp
 		"code_challenge_method": req.CodeChallengeMethod,
 		"grant_type":            GrantTypeAuthorizationCode,
 		"created_at":            time.Now().Unix(),
+		"user_id":               principal.UserID,
+		"account_id":            principal.AccountID,
 	}
-	for k, v := range meta {
-		rec[k] = v
-	}
-	_, err := s.tokensColl.InsertOne(ctx, rec)
+	_, err = s.tokensColl.InsertOne(ctx, rec)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +256,10 @@ func (s *MongoServer) Token(ctx context.Context, req TokenRequest) (*TokenRespon
 	now := time.Now()
 	switch req.GrantType {
 	case string(GrantTypeAuthorizationCode):
-		// 1) fetch the code record
+		if err := validateTokenClient(ctx, s, req); err != nil {
+			return nil, err
+		}
+		codeHash := hashOpaqueToken(req.Code)
 		var rec struct {
 			Code                string `bson:"code"`
 			ClientID            string `bson:"client_id"`
@@ -267,66 +267,112 @@ func (s *MongoServer) Token(ctx context.Context, req TokenRequest) (*TokenRespon
 			Scope               string `bson:"scope"`
 			CodeChallenge       string `bson:"code_challenge"`
 			CodeChallengeMethod string `bson:"code_challenge_method"`
+			CreatedAt           int64  `bson:"created_at"`
 		}
-		err := s.tokensColl.FindOne(ctx, bson.M{"code": req.Code}).Decode(&rec)
+		err := s.tokensColl.FindOne(ctx, bson.M{"code": codeHash}).Decode(&rec)
 		if err != nil {
 			return nil, errors.New("invalid authorization code")
 		}
-		// 2) validate redirect URI
 		if rec.RedirectURI != req.RedirectURI {
 			return nil, errors.New("redirect_uri mismatch")
 		}
-		// 3) validate PKCE if used
-		if rec.CodeChallenge != "" {
-			switch rec.CodeChallengeMethod {
-			case "S256":
-				if !ValidateCodeChallenge(req.CodeVerifier, rec.CodeChallenge) {
-					return nil, errors.New("invalid code_verifier")
-				}
-			case "plain":
-				if req.CodeVerifier != rec.CodeChallenge {
-					return nil, errors.New("invalid code_verifier")
-				}
-			default:
-				return nil, errors.New("unsupported code_challenge_method")
-			}
+		if rec.ClientID != req.ClientID {
+			return nil, errors.New("authorization code client mismatch")
 		}
-		// 4) issue tokens
-		accessToken := primitive.NewObjectID().Hex()
-		refreshToken := primitive.NewObjectID().Hex()
-		expiresAt := now.Add(time.Hour).Unix()
-		// update record
-		_, err = s.tokensColl.UpdateOne(ctx,
-			bson.M{"code": req.Code},
-			bson.M{"$set": bson.M{"access_token": accessToken, "refresh_token": refreshToken, "expires_at": expiresAt}},
-		)
+		if rec.CreatedAt <= 0 || now.After(time.Unix(rec.CreatedAt, 0).Add(authorizationCodeTTL)) {
+			return nil, errors.New("authorization code expired")
+		}
+		if rec.CodeChallengeMethod != "S256" || rec.CodeChallenge == "" || !ValidateCodeChallenge(req.CodeVerifier, rec.CodeChallenge) {
+			return nil, errors.New("invalid code_verifier")
+		}
+		accessToken, err := newOpaqueToken()
 		if err != nil {
 			return nil, err
+		}
+		refreshToken, err := newOpaqueToken()
+		if err != nil {
+			return nil, err
+		}
+		expiresAt := now.Add(time.Hour).Unix()
+		filter := bson.M{
+			"code":         codeHash,
+			"client_id":    req.ClientID,
+			"redirect_uri": req.RedirectURI,
+			"created_at":   bson.M{"$gte": now.Add(-authorizationCodeTTL).Unix()},
+		}
+		update := bson.M{
+			"$unset": bson.M{"code": ""},
+			"$set": bson.M{
+				"access_token":       hashOpaqueToken(accessToken),
+				"refresh_token":      hashOpaqueToken(refreshToken),
+				"refresh_history":    bson.A{},
+				"refresh_generation": int64(0),
+				"refresh_revoked_at": int64(0),
+				"expires_at":         expiresAt,
+			},
+		}
+		result, err := s.tokensColl.UpdateOne(ctx, filter, update)
+		if err != nil {
+			return nil, err
+		}
+		if result.MatchedCount != 1 {
+			return nil, errors.New("authorization code already consumed")
 		}
 		return &TokenResponse{AccessToken: accessToken, TokenType: "Bearer", ExpiresIn: int64(time.Hour.Seconds()), RefreshToken: refreshToken, Scope: rec.Scope}, nil
 
 	case string(GrantTypeRefreshToken):
-		// refresh existing token
-		var rec struct {
-			RefreshToken string `bson:"refresh_token"`
-			ClientID     string `bson:"client_id"`
-			Scope        string `bson:"scope"`
+		if err := validateTokenClient(ctx, s, req); err != nil {
+			return nil, err
 		}
-		err := s.tokensColl.FindOne(ctx, bson.M{"refresh_token": req.RefreshToken}).Decode(&rec)
-		if err != nil {
-			return nil, errors.New("invalid refresh token")
-		}
-		// issue new access token
-		accessToken := primitive.NewObjectID().Hex()
-		expiresAt := now.Add(time.Hour).Unix()
-		_, err = s.tokensColl.UpdateOne(ctx,
-			bson.M{"refresh_token": req.RefreshToken},
-			bson.M{"$set": bson.M{"access_token": accessToken, "expires_at": expiresAt}},
-		)
+		refreshHash := hashOpaqueToken(req.RefreshToken)
+		accessToken, err := newOpaqueToken()
 		if err != nil {
 			return nil, err
 		}
-		return &TokenResponse{AccessToken: accessToken, TokenType: "Bearer", ExpiresIn: int64(time.Hour.Seconds()), RefreshToken: req.RefreshToken, Scope: rec.Scope}, nil
+		refreshToken, err := newOpaqueToken()
+		if err != nil {
+			return nil, err
+		}
+		expiresAt := now.Add(time.Hour).Unix()
+		var rec struct {
+			Scope string `bson:"scope"`
+		}
+		err = s.tokensColl.FindOneAndUpdate(ctx,
+			bson.M{
+				"refresh_token":      refreshHash,
+				"client_id":          req.ClientID,
+				"refresh_revoked_at": int64(0),
+			},
+			bson.M{
+				"$push": bson.M{"refresh_history": refreshHash},
+				"$inc":  bson.M{"refresh_generation": int64(1)},
+				"$set": bson.M{
+					"access_token":  hashOpaqueToken(accessToken),
+					"refresh_token": hashOpaqueToken(refreshToken),
+					"expires_at":    expiresAt,
+				},
+			},
+			options.FindOneAndUpdate().SetReturnDocument(options.After),
+		).Decode(&rec)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			result, revokeErr := s.tokensColl.UpdateOne(ctx,
+				bson.M{"client_id": req.ClientID, "refresh_history": refreshHash},
+				bson.M{
+					"$set":   bson.M{"refresh_revoked_at": now.Unix(), "expires_at": int64(0)},
+					"$unset": bson.M{"access_token": "", "refresh_token": ""},
+				})
+			if revokeErr != nil {
+				return nil, revokeErr
+			}
+			if result.MatchedCount == 1 {
+				return nil, errors.New("refresh token reuse detected")
+			}
+			return nil, errors.New("invalid refresh token")
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &TokenResponse{AccessToken: accessToken, TokenType: "Bearer", ExpiresIn: int64(time.Hour.Seconds()), RefreshToken: refreshToken, Scope: rec.Scope}, nil
 
 	case "client_credentials":
 		// authenticate client
@@ -352,12 +398,15 @@ func (s *MongoServer) Token(ctx context.Context, req TokenRequest) (*TokenRespon
 		if !allowed {
 			return nil, errors.New("grant_type not allowed")
 		}
-		accessToken := primitive.NewObjectID().Hex()
+		accessToken, err := newOpaqueToken()
+		if err != nil {
+			return nil, err
+		}
 		expiresAt := now.Add(time.Hour).Unix()
 		scopeStr := strings.Join(cli.Scopes, " ")
 		// insert token record
 		_, err = s.tokensColl.InsertOne(ctx, bson.M{
-			"access_token": accessToken,
+			"access_token": hashOpaqueToken(accessToken),
 			"client_id":    req.ClientID,
 			"scope":        scopeStr,
 			"grant_type":   "client_credentials",
@@ -375,14 +424,15 @@ func (s *MongoServer) Token(ctx context.Context, req TokenRequest) (*TokenRespon
 
 // Revoke invalidates a token (remove or mark revoked)
 func (s *MongoServer) Revoke(ctx context.Context, req RevocationRequest) error {
-	_, err := s.tokensColl.DeleteOne(ctx, bson.M{"$or": []bson.M{{"access_token": req.Token}, {"refresh_token": req.Token}}})
+	tokenHash := hashOpaqueToken(req.Token)
+	_, err := s.tokensColl.DeleteOne(ctx, bson.M{"$or": []bson.M{{"access_token": tokenHash}, {"refresh_token": tokenHash}}})
 	return err
 }
 
 // Introspect checks active state of a token
 func (s *MongoServer) Introspect(ctx context.Context, req IntrospectRequest) (*IntrospectResponse, error) {
 	var doc bson.M
-	err := s.tokensColl.FindOne(ctx, bson.M{"access_token": req.Token}).Decode(&doc)
+	err := s.tokensColl.FindOne(ctx, bson.M{"access_token": hashOpaqueToken(req.Token)}).Decode(&doc)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return &IntrospectResponse{Active: false}, nil
@@ -482,7 +532,7 @@ func (s *MongoServer) HasAccess(r *http.Request, resource string, hasRbacAccess 
 	}
 	token := strings.TrimPrefix(auth, "Bearer ")
 	var doc bson.M
-	err := s.tokensColl.FindOne(ctx, bson.M{"access_token": token}).Decode(&doc)
+	err := s.tokensColl.FindOne(ctx, bson.M{"access_token": hashOpaqueToken(token)}).Decode(&doc)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return false, nil

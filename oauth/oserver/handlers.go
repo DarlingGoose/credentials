@@ -18,12 +18,28 @@ const (
 )
 
 type Handler struct {
-	server      OServer
-	contentType ContentType
+	server            OServer
+	contentType       ContentType
+	principalResolver func(*http.Request) (AuthorizationPrincipal, error)
 }
 
-func NewHandler(server OServer, contentType ContentType) Handler {
-	return Handler{server: server, contentType: contentType}
+type HandlerOption func(*Handler)
+
+// WithAuthorizationPrincipalResolver supplies the mandatory trust boundary for
+// authorization-code issuance. The resolver must use authenticated server
+// context; it must not copy caller-controlled headers or request parameters.
+func WithAuthorizationPrincipalResolver(resolver func(*http.Request) (AuthorizationPrincipal, error)) HandlerOption {
+	return func(handler *Handler) { handler.principalResolver = resolver }
+}
+
+func NewHandler(server OServer, contentType ContentType, options ...HandlerOption) Handler {
+	handler := Handler{server: server, contentType: contentType}
+	for _, option := range options {
+		if option != nil {
+			option(&handler)
+		}
+	}
+	return handler
 }
 
 // Authorize handles the OAuth 2.0 authorization endpoint requests.
@@ -50,10 +66,9 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	// For this example, we'll use a query parameter `force_consent=true` to trigger it.
 	forceConsent := q.Get("force_consent") == "true"
 
-	// Retrieve client details. First try mock clients, then the actual OServer.
-	client, err := h.server.GetClient(r.Context(), req.ClientID)
-	if err != nil || client == nil {
-		http.Error(w, fmt.Sprintf("client not found or unable to retrieve client details: %s", req.ClientID), http.StatusBadRequest)
+	_, client, err := h.resolveAuthorization(r, req)
+	if err != nil {
+		h.writeAuthorizationError(w, err)
 		return
 	}
 
@@ -88,7 +103,12 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 // proceedAuthorization is a helper function to encapsulate the logic for
 // completing the authorization flow and redirecting the user.
 func (h *Handler) proceedAuthorization(w http.ResponseWriter, r *http.Request, req AuthRequest) {
-	resp, err := h.server.Authorize(r.Context(), req)
+	principal, _, err := h.resolveAuthorization(r, req)
+	if err != nil {
+		h.writeAuthorizationError(w, err)
+		return
+	}
+	resp, err := h.server.Authorize(r.Context(), principal, req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -106,6 +126,32 @@ func (h *Handler) proceedAuthorization(w http.ResponseWriter, r *http.Request, r
 	}
 	u.RawQuery = s.Encode()
 	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+func (h *Handler) resolveAuthorization(r *http.Request, req AuthRequest) (AuthorizationPrincipal, *OAuthClient, error) {
+	if h.principalResolver == nil {
+		return AuthorizationPrincipal{}, nil, ErrAuthenticationRequired
+	}
+	principal, err := h.principalResolver(r)
+	if err != nil {
+		return AuthorizationPrincipal{}, nil, ErrAuthenticationRequired
+	}
+	if err := validateAuthorizationPrincipal(principal); err != nil {
+		return AuthorizationPrincipal{}, nil, err
+	}
+	client, err := ValidateAuthorizationRequest(r.Context(), h.server, req)
+	if err != nil {
+		return AuthorizationPrincipal{}, nil, err
+	}
+	return principal, client, nil
+}
+
+func (h *Handler) writeAuthorizationError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrAuthenticationRequired) {
+		http.Error(w, ErrAuthenticationRequired.Error(), http.StatusUnauthorized)
+		return
+	}
+	http.Error(w, ErrInvalidAuthorization.Error(), http.StatusBadRequest)
 }
 
 func (h *Handler) parseAuthRequest(r *http.Request) (*AuthRequest, error) {
@@ -155,6 +201,10 @@ func (h *Handler) Consent(w http.ResponseWriter, r *http.Request) {
 	case "accept":
 		h.proceedAuthorization(w, r, *req)
 	case "deny":
+		if _, _, err := h.resolveAuthorization(r, *req); err != nil {
+			h.writeAuthorizationError(w, err)
+			return
+		}
 		u, err := url.Parse(req.RedirectURI)
 		if err != nil {
 			http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
@@ -418,6 +468,17 @@ func (h *Handler) parseTokenRequest(r *http.Request) (TokenRequest, error) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			return req, err
 		}
+	}
+	if req.ClientSecret != "" {
+		req.ClientAuthMethod = "client_secret_post"
+	}
+	if clientID, clientSecret, ok := r.BasicAuth(); ok {
+		if req.ClientID != "" || req.ClientSecret != "" {
+			return req, errors.New("conflicting client credentials")
+		}
+		req.ClientID = clientID
+		req.ClientSecret = clientSecret
+		req.ClientAuthMethod = "client_secret_basic"
 	}
 	return req, nil
 }

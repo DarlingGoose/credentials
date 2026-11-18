@@ -341,16 +341,23 @@ func TestMongoServer_Authorize(t *testing.T) {
 	mt.Run("success", func(mt *mtest.T) {
 		server := newTestMongoServer(mt)
 		req := AuthRequest{
+			ResponseType:        "code",
 			ClientID:            "auth_client",
 			RedirectURI:         "http://auth.callback",
 			Scope:               "profile",
 			State:               "xyz",
-			CodeChallenge:       "challenge123",
+			CodeChallenge:       GenerateCodeChallenge("test-verifier"),
 			CodeChallengeMethod: "S256",
 		}
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, bson.D{
+			{Key: "client_id", Value: req.ClientID}, {Key: "account_id", Value: "account-1"},
+			{Key: "client_secret", Value: "secret"}, {Key: "name", Value: "client"},
+			{Key: "redirect_uris", Value: primitive.A{req.RedirectURI}}, {Key: "scopes", Value: primitive.A{"profile"}},
+			{Key: "grant_types", Value: primitive.A{string(GrantTypeAuthorizationCode)}}, {Key: "response_types", Value: primitive.A{"code"}},
+		}))
 		mt.AddMockResponses(mtest.CreateSuccessResponse()) // Simulate successful insert
 
-		res, err := server.Authorize(context.Background(), req)
+		res, err := server.Authorize(context.Background(), AuthorizationPrincipal{UserID: "user-1", AccountID: "account-1"}, req)
 		if err != nil {
 			mt.Fatalf("Authorize failed: %v", err)
 		}
@@ -364,10 +371,16 @@ func TestMongoServer_Authorize(t *testing.T) {
 
 	mt.Run("insert error", func(mt *mtest.T) {
 		server := newTestMongoServer(mt)
-		req := AuthRequest{ClientID: "error_auth_client"}
+		req := AuthRequest{ResponseType: "code", ClientID: "error_auth_client", RedirectURI: "https://client.example/callback", Scope: "profile", CodeChallenge: GenerateCodeChallenge("test-verifier"), CodeChallengeMethod: "S256"}
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, bson.D{
+			{Key: "client_id", Value: req.ClientID}, {Key: "account_id", Value: "account-1"},
+			{Key: "client_secret", Value: "secret"}, {Key: "name", Value: "client"},
+			{Key: "redirect_uris", Value: primitive.A{req.RedirectURI}}, {Key: "scopes", Value: primitive.A{"profile"}},
+			{Key: "grant_types", Value: primitive.A{string(GrantTypeAuthorizationCode)}}, {Key: "response_types", Value: primitive.A{"code"}},
+		}))
 		mt.AddMockResponses(mtest.CreateWriteErrorsResponse(mtest.WriteError{Code: 1, Message: "auth insert error"}))
 
-		_, err := server.Authorize(context.Background(), req)
+		_, err := server.Authorize(context.Background(), AuthorizationPrincipal{UserID: "user-1"}, req)
 		if err == nil {
 			mt.Fatal("Authorize did not return an error for insert failure")
 		}
@@ -381,261 +394,108 @@ func TestMongoServer_Token_AuthorizationCode(t *testing.T) {
 	mt := mtest.New(t, mtest.NewOptions().ClientType(mtest.Mock))
 	defer mt.ClearCollections()
 
-	mt.Run("success_no_pkce", func(mt *mtest.T) {
+	clientDoc := func(clientID string) bson.D {
+		return bson.D{
+			{Key: "client_id", Value: clientID},
+			{Key: "token_endpoint_auth_method", Value: "none"},
+		}
+	}
+	authDoc := func(code, clientID, redirectURI, challenge string, createdAt int64) bson.D {
+		return bson.D{
+			{Key: "code", Value: hashOpaqueToken(code)},
+			{Key: "client_id", Value: clientID},
+			{Key: "redirect_uri", Value: redirectURI},
+			{Key: "scope", Value: "openid"},
+			{Key: "code_challenge", Value: challenge},
+			{Key: "code_challenge_method", Value: "S256"},
+			{Key: "created_at", Value: createdAt},
+		}
+	}
+
+	mt.Run("success consumes code atomically", func(mt *mtest.T) {
 		server := newTestMongoServer(mt)
 		code := primitive.NewObjectID().Hex()
-		authRec := bson.D{
-			{Key: "code", Value: code},
-			{Key: "client_id", Value: "test_client"},
-			{Key: "redirect_uri", Value: "http://callback.com"},
-			{Key: "scope", Value: "email profile"},
-			{Key: "code_challenge", Value: ""},
-			{Key: "code_challenge_method", Value: ""},
-		}
-
-		// Mock responses for FindOne and UpdateOne
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, authRec))
-		mt.AddMockResponses(mtest.CreateSuccessResponse())
-		mt.AddMockResponses(
-			mtest.CreateSuccessResponse(
-				bson.E{Key: "n", Value: int64(1)},         // matched count
-				bson.E{Key: "nModified", Value: int64(1)}, // modified count
-			),
-		)
-		req := TokenRequest{
-			GrantType:   string(GrantTypeAuthorizationCode),
-			Code:        code,
-			RedirectURI: "http://callback.com",
-		}
-		res, err := server.Token(context.Background(), req)
-		if err != nil {
-			mt.Fatalf("Token (auth code, no PKCE) failed: %v", err)
-		}
-		if res.AccessToken == "" || res.RefreshToken == "" {
-			mt.Error("Access or refresh token is empty")
-		}
-		if res.Scope != "email profile" {
-			mt.Errorf("Expected scope 'email profile', got %s", res.Scope)
-		}
-	})
-
-	mt.Run("success_pkce_s256", func(mt *mtest.T) {
-		server := newTestMongoServer(mt)
-		code := primitive.NewObjectID().Hex()
-		codeVerifier, err := GenerateCodeVerifier() // Example verifier
-
+		codeVerifier, err := GenerateCodeVerifier()
 		if err != nil {
 			mt.Fatalf("GenerateCodeVerifier failed: %v", err)
 		}
-		sha256Hash := GenerateCodeChallenge(codeVerifier) // Base64RawURLEncoding of SHA256(codeVerifier)
-		authRec := bson.D{
-			{Key: "code", Value: code},
-			{Key: "client_id", Value: "pkce_client"},
-			{Key: "redirect_uri", Value: "http://pkce.callback"},
-			{Key: "scope", Value: "openid"},
-			{Key: "code_challenge", Value: sha256Hash},
-			{Key: "code_challenge_method", Value: "S256"},
-		}
-
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, authRec))
-		mt.AddMockResponses(mtest.CreateSuccessResponse())
+		clientID := "pkce_client"
+		redirectURI := "https://client.example/callback"
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, clientDoc(clientID)))
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch,
+			authDoc(code, clientID, redirectURI, GenerateCodeChallenge(codeVerifier), time.Now().Unix())))
 		mt.AddMockResponses(
 			mtest.CreateSuccessResponse(
-				bson.E{Key: "n", Value: int64(1)},         // matched count
-				bson.E{Key: "nModified", Value: int64(1)}, // modified count
+				bson.E{Key: "n", Value: int64(1)},
+				bson.E{Key: "nModified", Value: int64(1)},
 			),
 		)
 		req := TokenRequest{
 			GrantType:    string(GrantTypeAuthorizationCode),
 			Code:         code,
-			RedirectURI:  "http://pkce.callback",
+			ClientID:     clientID,
+			RedirectURI:  redirectURI,
 			CodeVerifier: codeVerifier,
 		}
 		res, err := server.Token(context.Background(), req)
 		if err != nil {
-			mt.Fatalf("Token (auth code, PKCE S256) failed: %v", err)
+			mt.Fatalf("Token failed: %v", err)
 		}
-		if res.AccessToken == "" {
-			mt.Error("Access token is empty")
+		if res.AccessToken == "" || res.RefreshToken == "" || res.Scope != "openid" {
+			mt.Fatalf("unexpected response: %#v", res)
 		}
-	})
-
-	mt.Run("success_pkce_plain", func(mt *mtest.T) {
-		server := newTestMongoServer(mt)
-		code := primitive.NewObjectID().Hex()
-		codeVerifier := "plain_verifier_string"
-		authRec := bson.D{
-			{Key: "code", Value: code},
-			{Key: "client_id", Value: "pkce_plain_client"},
-			{Key: "redirect_uri", Value: "http://pkce.plain.callback"},
-			{Key: "scope", Value: "read"},
-			{Key: "code_challenge", Value: codeVerifier},
-			{Key: "code_challenge_method", Value: "plain"},
-		}
-
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, authRec))
-		mt.AddMockResponses(mtest.CreateSuccessResponse())
-		mt.AddMockResponses(
-			mtest.CreateSuccessResponse(
-				bson.E{Key: "n", Value: int64(1)},         // matched count
-				bson.E{Key: "nModified", Value: int64(1)}, // modified count
-			),
-		)
-
-		req := TokenRequest{
-			GrantType:    string(GrantTypeAuthorizationCode),
-			Code:         code,
-			RedirectURI:  "http://pkce.plain.callback",
-			CodeVerifier: codeVerifier,
-		}
-		res, err := server.Token(context.Background(), req)
-		if err != nil {
-			mt.Fatalf("Token (auth code, PKCE plain) failed: %v", err)
-		}
-		if res.AccessToken == "" {
-			mt.Error("Access token is empty")
+		events := mt.GetAllStartedEvents()
+		started := events[len(events)-1]
+		unsetCode := started.Command.Lookup("updates").Array().Index(0).Value().Document().Lookup("u").Document().Lookup("$unset").Document().Lookup("code")
+		if started.CommandName != "update" || unsetCode.Type == 0 {
+			mt.Fatal("token update did not unset the authorization code")
 		}
 	})
 
-	mt.Run("invalid code", func(mt *mtest.T) {
+	mt.Run("expired code", func(mt *mtest.T) {
 		server := newTestMongoServer(mt)
-		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch)) // Simulate no documents found
-
-		req := TokenRequest{GrantType: string(GrantTypeAuthorizationCode), Code: "invalid"}
+		verifier, _ := GenerateCodeVerifier()
+		clientID := "expired_client"
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, clientDoc(clientID)))
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch,
+			authDoc("expired", clientID, "https://client.example/cb", GenerateCodeChallenge(verifier), time.Now().Add(-authorizationCodeTTL-time.Second).Unix())))
+		req := TokenRequest{GrantType: string(GrantTypeAuthorizationCode), Code: "expired", ClientID: clientID,
+			RedirectURI: "https://client.example/cb", CodeVerifier: verifier}
 		_, err := server.Token(context.Background(), req)
-		if err == nil {
-			mt.Fatal("Token did not return an error for invalid code")
-		}
-		if err.Error() != "invalid authorization code" {
-			mt.Errorf("Expected 'invalid authorization code', got: %v", err)
+		if err == nil || err.Error() != "authorization code expired" {
+			mt.Fatalf("expected expiration error, got %v", err)
 		}
 	})
 
-	mt.Run("redirect_uri mismatch", func(mt *mtest.T) {
+	mt.Run("requires S256 PKCE", func(mt *mtest.T) {
 		server := newTestMongoServer(mt)
-		code := primitive.NewObjectID().Hex()
-		authRec := bson.D{
-			{Key: "code", Value: code},
-			{Key: "redirect_uri", Value: "http://correct.callback"},
-		}
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, authRec))
-
-		req := TokenRequest{
-			GrantType:   string(GrantTypeAuthorizationCode),
-			Code:        code,
-			RedirectURI: "http://wrong.callback",
-		}
+		clientID := "legacy_client"
+		doc := authDoc("plain", clientID, "https://client.example/cb", "plain-verifier", time.Now().Unix())
+		doc[5] = bson.E{Key: "code_challenge_method", Value: "plain"}
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, clientDoc(clientID)))
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, doc))
+		req := TokenRequest{GrantType: string(GrantTypeAuthorizationCode), Code: "plain", ClientID: clientID,
+			RedirectURI: "https://client.example/cb", CodeVerifier: "plain-verifier"}
 		_, err := server.Token(context.Background(), req)
-		if err == nil {
-			mt.Fatal("Token did not return an error for redirect_uri mismatch")
-		}
-		if err.Error() != "redirect_uri mismatch" {
-			mt.Errorf("Expected 'redirect_uri mismatch', got: %v", err)
+		if err == nil || err.Error() != "invalid code_verifier" {
+			mt.Fatalf("expected PKCE rejection, got %v", err)
 		}
 	})
 
-	mt.Run("invalid code_verifier S256", func(mt *mtest.T) {
+	mt.Run("atomic consume detects replay race", func(mt *mtest.T) {
 		server := newTestMongoServer(mt)
-		code := primitive.NewObjectID().Hex()
-		authRec := bson.D{
-			{Key: "code", Value: code},
-			{Key: "redirect_uri", Value: "http://pkce.callback"},
-			{Key: "code_challenge", Value: "some_challenge"},
-			{Key: "code_challenge_method", Value: "S256"},
-		}
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, authRec))
-
-		req := TokenRequest{
-			GrantType:    string(GrantTypeAuthorizationCode),
-			Code:         code,
-			RedirectURI:  "http://pkce.callback",
-			CodeVerifier: "wrong_verifier",
-		}
+		verifier, _ := GenerateCodeVerifier()
+		clientID := "race_client"
+		redirectURI := "https://client.example/cb"
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, clientDoc(clientID)))
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch,
+			authDoc("race", clientID, redirectURI, GenerateCodeChallenge(verifier), time.Now().Unix())))
+		mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "n", Value: int64(0)}, bson.E{Key: "nModified", Value: int64(0)}))
+		req := TokenRequest{GrantType: string(GrantTypeAuthorizationCode), Code: "race", ClientID: clientID,
+			RedirectURI: redirectURI, CodeVerifier: verifier}
 		_, err := server.Token(context.Background(), req)
-		if err == nil {
-			mt.Fatal("Token did not return an error for invalid code_verifier S256")
-		}
-		if err.Error() != "invalid code_verifier" {
-			mt.Errorf("Expected 'invalid code_verifier', got: %v", err)
-		}
-	})
-
-	mt.Run("invalid code_verifier plain", func(mt *mtest.T) {
-		server := newTestMongoServer(mt)
-		code := primitive.NewObjectID().Hex()
-		authRec := bson.D{
-			{Key: "code", Value: code},
-			{Key: "redirect_uri", Value: "http://pkce.callback"},
-			{Key: "code_challenge", Value: "correct_plain_verifier"},
-			{Key: "code_challenge_method", Value: "plain"},
-		}
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, authRec))
-
-		req := TokenRequest{
-			GrantType:    string(GrantTypeAuthorizationCode),
-			Code:         code,
-			RedirectURI:  "http://pkce.callback",
-			CodeVerifier: "wrong_plain_verifier",
-		}
-		_, err := server.Token(context.Background(), req)
-		if err == nil {
-			mt.Fatal("Token did not return an error for invalid code_verifier plain")
-		}
-		if err.Error() != "invalid code_verifier" {
-			mt.Errorf("Expected 'invalid code_verifier', got: %v", err)
-		}
-	})
-
-	mt.Run("unsupported code_challenge_method", func(mt *mtest.T) {
-		server := newTestMongoServer(mt)
-		code := primitive.NewObjectID().Hex()
-		authRec := bson.D{
-			{Key: "code", Value: code},
-			{Key: "redirect_uri", Value: "http://pkce.callback"},
-			{Key: "code_challenge", Value: "some_challenge"},
-			{Key: "code_challenge_method", Value: "unsupported"},
-		}
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, authRec))
-
-		req := TokenRequest{
-			GrantType:    string(GrantTypeAuthorizationCode),
-			Code:         code,
-			RedirectURI:  "http://pkce.callback",
-			CodeVerifier: "any_verifier",
-		}
-		_, err := server.Token(context.Background(), req)
-		if err == nil {
-			mt.Fatal("Token did not return an error for unsupported code_challenge_method")
-		}
-		if err.Error() != "unsupported code_challenge_method" {
-			mt.Errorf("Expected 'unsupported code_challenge_method', got: %v", err)
-		}
-	})
-
-	mt.Run("update error", func(mt *mtest.T) {
-		server := newTestMongoServer(mt)
-		code := primitive.NewObjectID().Hex()
-		authRec := bson.D{
-			{Key: "code", Value: code},
-			{Key: "client_id", Value: "test_client"},
-			{Key: "redirect_uri", Value: "http://callback.com"},
-			{Key: "scope", Value: "email profile"},
-		}
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, authRec))
-		mt.AddMockResponses(mtest.CreateCommandErrorResponse(mtest.CommandError{Code: 1, Message: "token update error"}))
-		mt.AddMockResponses(mtest.CreateCommandErrorResponse(mtest.CommandError{Code: 1, Message: "token update error"}))
-
-		req := TokenRequest{
-			GrantType:   string(GrantTypeAuthorizationCode),
-			Code:        code,
-			RedirectURI: "http://callback.com",
-		}
-		_, err := server.Token(context.Background(), req)
-		if err == nil {
-			mt.Fatal("Token did not return an error for update failure")
-		}
-		if !strings.Contains(err.Error(), "token update error") {
-			mt.Errorf("Expected 'token update error', got: %v", err)
+		if err == nil || err.Error() != "authorization code already consumed" {
+			mt.Fatalf("expected replay error, got %v", err)
 		}
 	})
 }
@@ -646,24 +506,22 @@ func TestMongoServer_Token_RefreshToken(t *testing.T) {
 
 	mt.Run("success", func(mt *mtest.T) {
 		server := newTestMongoServer(mt)
-		refreshToken := primitive.NewObjectID().Hex()
+		refreshToken, _ := newOpaqueToken()
+		clientID := "refresh_client"
 		tokenRec := bson.D{
-			{Key: "refresh_token", Value: refreshToken},
-			{Key: "client_id", Value: "refresh_client"},
+			{Key: "refresh_token", Value: hashOpaqueToken(refreshToken)},
+			{Key: "client_id", Value: clientID},
 			{Key: "scope", Value: "offline_access"},
 		}
 
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, tokenRec))
-		mt.AddMockResponses(mtest.CreateSuccessResponse())
-		mt.AddMockResponses(
-			mtest.CreateSuccessResponse(
-				bson.E{Key: "n", Value: int64(1)},         // matched count
-				bson.E{Key: "nModified", Value: int64(1)}, // modified count
-			),
-		)
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, bson.D{
+			{Key: "client_id", Value: clientID}, {Key: "token_endpoint_auth_method", Value: "none"},
+		}))
+		mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "value", Value: tokenRec}))
 		req := TokenRequest{
 			GrantType:    string(GrantTypeRefreshToken),
 			RefreshToken: refreshToken,
+			ClientID:     clientID,
 		}
 		res, err := server.Token(context.Background(), req)
 		if err != nil {
@@ -672,8 +530,8 @@ func TestMongoServer_Token_RefreshToken(t *testing.T) {
 		if res.AccessToken == "" {
 			mt.Error("Access token is empty after refresh")
 		}
-		if res.RefreshToken != refreshToken {
-			mt.Errorf("Refresh token changed unexpectedly. Expected %s, got %s", refreshToken, res.RefreshToken)
+		if res.RefreshToken == "" || res.RefreshToken == refreshToken {
+			mt.Errorf("refresh token was not rotated: old=%s new=%s", refreshToken, res.RefreshToken)
 		}
 		if res.Scope != "offline_access" {
 			mt.Errorf("Expected scope 'offline_access', got %s", res.Scope)
@@ -682,9 +540,14 @@ func TestMongoServer_Token_RefreshToken(t *testing.T) {
 
 	mt.Run("invalid refresh token", func(mt *mtest.T) {
 		server := newTestMongoServer(mt)
-		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch)) // Simulate no documents found
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, bson.D{
+			{Key: "client_id", Value: "refresh_client"}, {Key: "token_endpoint_auth_method", Value: "none"},
+		}))
+		mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "value", Value: nil}))
+		mt.AddMockResponses(mtest.CreateSuccessResponse(
+			bson.E{Key: "n", Value: int64(0)}, bson.E{Key: "nModified", Value: int64(0)}))
 
-		req := TokenRequest{GrantType: string(GrantTypeRefreshToken), RefreshToken: "invalid_refresh"}
+		req := TokenRequest{GrantType: string(GrantTypeRefreshToken), RefreshToken: "invalid_refresh", ClientID: "refresh_client"}
 		_, err := server.Token(context.Background(), req)
 		if err == nil {
 			mt.Fatal("Token did not return an error for invalid refresh token")
@@ -696,19 +559,17 @@ func TestMongoServer_Token_RefreshToken(t *testing.T) {
 
 	mt.Run("update error", func(mt *mtest.T) {
 		server := newTestMongoServer(mt)
-		refreshToken := primitive.NewObjectID().Hex()
-		tokenRec := bson.D{
-			{Key: "refresh_token", Value: refreshToken},
-			{Key: "client_id", Value: "refresh_client"},
-			{Key: "scope", Value: "offline_access"},
-		}
-		mt.AddMockResponses(mtest.CreateCursorResponse(1, "foo.bar", mtest.FirstBatch, tokenRec))
-		mt.AddMockResponses(mtest.CreateCommandErrorResponse(mtest.CommandError{Code: 1, Message: "refresh update error"}))
+		refreshToken, _ := newOpaqueToken()
+		clientID := "refresh_client"
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, bson.D{
+			{Key: "client_id", Value: clientID}, {Key: "token_endpoint_auth_method", Value: "none"},
+		}))
 		mt.AddMockResponses(mtest.CreateCommandErrorResponse(mtest.CommandError{Code: 1, Message: "refresh update error"}))
 
 		req := TokenRequest{
 			GrantType:    string(GrantTypeRefreshToken),
 			RefreshToken: refreshToken,
+			ClientID:     clientID,
 		}
 		_, err := server.Token(context.Background(), req)
 		if err == nil {
@@ -716,6 +577,29 @@ func TestMongoServer_Token_RefreshToken(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "refresh update error") {
 			mt.Errorf("Expected 'refresh update error', got: %v", err)
+		}
+	})
+
+	mt.Run("reuse revokes family", func(mt *mtest.T) {
+		server := newTestMongoServer(mt)
+		clientID := "refresh_client"
+		mt.AddMockResponses(mtest.CreateCursorResponse(0, "foo.bar", mtest.FirstBatch, bson.D{
+			{Key: "client_id", Value: clientID}, {Key: "token_endpoint_auth_method", Value: "none"},
+		}))
+		mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "value", Value: nil}))
+		mt.AddMockResponses(mtest.CreateSuccessResponse(
+			bson.E{Key: "n", Value: int64(1)}, bson.E{Key: "nModified", Value: int64(1)}))
+
+		_, err := server.Token(context.Background(), TokenRequest{
+			GrantType: string(GrantTypeRefreshToken), RefreshToken: "previous-token", ClientID: clientID,
+		})
+		if err == nil || err.Error() != "refresh token reuse detected" {
+			mt.Fatalf("expected reuse detection, got %v", err)
+		}
+		events := mt.GetAllStartedEvents()
+		update := events[len(events)-1].Command.Lookup("updates").Array().Index(0).Value().Document().Lookup("u").Document()
+		if update.Lookup("$unset").Type == 0 {
+			mt.Fatal("reuse response did not revoke current family credentials")
 		}
 	})
 }

@@ -70,6 +70,18 @@ func (s *PostgresServer) ensureSchema(ctx context.Context) error {
 			created_at           BIGINT      NOT NULL DEFAULT 0
 		);
 
+		CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+			token_hash  TEXT   PRIMARY KEY,
+			family_id   TEXT   NOT NULL,
+			client_id   TEXT   NOT NULL,
+			generation  BIGINT NOT NULL,
+			consumed_at BIGINT NOT NULL DEFAULT 0,
+			revoked_at  BIGINT NOT NULL DEFAULT 0,
+			created_at  BIGINT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS oauth_refresh_tokens_family_idx
+			ON oauth_refresh_tokens (family_id);
+
 		CREATE TABLE IF NOT EXISTS oauth_jwks (
 			id  BIGSERIAL PRIMARY KEY,
 			key JSONB     NOT NULL
@@ -105,6 +117,9 @@ func generateSecretPG(n int) (string, error) {
 func (s *PostgresServer) RegisterClient(ctx context.Context, client *OAuthClient) (*OAuthClient, error) {
 	if len(client.GrantTypes) == 0 {
 		client.GrantTypes = []string{"client_credentials"}
+	}
+	if client.TokenEndpointAuth == "" {
+		client.TokenEndpointAuth = "client_secret_post"
 	}
 	if len(client.RedirectURIs) == 0 {
 		return nil, fmt.Errorf("no redirect_uris provided")
@@ -241,28 +256,27 @@ func (s *PostgresServer) DeleteClient(ctx context.Context, clientID string) erro
 // --------------------------------------------------------------------------
 
 // Authorize issues an authorization code.
-func (s *PostgresServer) Authorize(ctx context.Context, req AuthRequest) (*AuthResponse, error) {
-	// Decode optional state payload (best-effort; errors are non-fatal).
-	meta := make(map[string]string)
-	if req.State != "" {
-		if d, err := base64.StdEncoding.DecodeString(req.State); err == nil {
-			_ = json.Unmarshal(d, &meta)
-		}
+
+func (s *PostgresServer) Authorize(ctx context.Context, principal AuthorizationPrincipal, req AuthRequest) (*AuthResponse, error) {
+	if err := validateAuthorizationPrincipal(principal); err != nil {
+		return nil, err
 	}
-
-	userID := meta["user_id"]
-	accountID := meta["account_id"]
-
-	code := uuid.New().String()
-	_, err := s.db.Exec(ctx, `
+	if _, err := ValidateAuthorizationRequest(ctx, s, req); err != nil {
+		return nil, err
+	}
+	code, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.db.Exec(ctx, `
 		INSERT INTO oauth_tokens
 			(code, client_id, user_id, account_id, redirect_uri, scope,
 			 code_challenge, code_challenge_method, grant_type, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		code,
+		hashOpaqueToken(code),
 		req.ClientID,
-		userID,
-		accountID,
+		principal.UserID,
+		principal.AccountID,
 		req.RedirectURI,
 		req.Scope,
 		req.CodeChallenge,
@@ -297,17 +311,27 @@ func (s *PostgresServer) Token(ctx context.Context, req TokenRequest) (*TokenRes
 }
 
 func (s *PostgresServer) tokenFromCode(ctx context.Context, req TokenRequest, now time.Time) (*TokenResponse, error) {
+	if err := validateTokenClient(ctx, s, req); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	var (
 		clientID            string
 		redirectURI         string
 		scope               string
 		codeChallenge       string
 		codeChallengeMethod string
+		createdAt           int64
 	)
-	err := s.db.QueryRow(ctx, `
-		SELECT client_id, redirect_uri, scope, code_challenge, code_challenge_method
-		FROM oauth_tokens WHERE code = $1`, req.Code).
-		Scan(&clientID, &redirectURI, &scope, &codeChallenge, &codeChallengeMethod)
+	codeHash := hashOpaqueToken(req.Code)
+	err = tx.QueryRow(ctx, `
+		SELECT client_id, redirect_uri, scope, code_challenge, code_challenge_method, created_at
+		FROM oauth_tokens WHERE code = $1 FOR UPDATE`, codeHash).
+		Scan(&clientID, &redirectURI, &scope, &codeChallenge, &codeChallengeMethod, &createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, errors.New("invalid authorization code")
 	}
@@ -318,32 +342,50 @@ func (s *PostgresServer) tokenFromCode(ctx context.Context, req TokenRequest, no
 	if redirectURI != req.RedirectURI {
 		return nil, errors.New("redirect_uri mismatch")
 	}
-
-	if codeChallenge != "" {
-		switch codeChallengeMethod {
-		case "S256":
-			if !ValidateCodeChallenge(req.CodeVerifier, codeChallenge) {
-				return nil, errors.New("invalid code_verifier")
-			}
-		case "plain":
-			if req.CodeVerifier != codeChallenge {
-				return nil, errors.New("invalid code_verifier")
-			}
-		default:
-			return nil, errors.New("unsupported code_challenge_method")
-		}
+	if clientID != req.ClientID {
+		return nil, errors.New("authorization code client mismatch")
+	}
+	if createdAt <= 0 || now.After(time.Unix(createdAt, 0).Add(authorizationCodeTTL)) {
+		return nil, errors.New("authorization code expired")
 	}
 
-	accessToken := uuid.New().String()
-	refreshToken := uuid.New().String()
-	expiresAt := now.Add(time.Hour).Unix()
+	if codeChallengeMethod != "S256" || codeChallenge == "" || !ValidateCodeChallenge(req.CodeVerifier, codeChallenge) {
+		return nil, errors.New("invalid code_verifier")
+	}
 
-	_, err = s.db.Exec(ctx, `
-		UPDATE oauth_tokens
-		SET access_token = $1, refresh_token = $2, expires_at = $3
-		WHERE code = $4`,
-		accessToken, refreshToken, expiresAt, req.Code)
+	accessToken, err := newOpaqueToken()
 	if err != nil {
+		return nil, err
+	}
+	refreshToken, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
+	expiresAt := now.Add(time.Hour).Unix()
+	familyID, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE oauth_tokens
+		SET code = NULL, access_token = $1, refresh_token = $2, expires_at = $3
+		WHERE code = $4 AND client_id = $5`,
+		hashOpaqueToken(accessToken), hashOpaqueToken(refreshToken), expiresAt, codeHash, req.ClientID)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, errors.New("authorization code already consumed")
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO oauth_refresh_tokens
+		(token_hash, family_id, client_id, generation, created_at)
+		VALUES ($1,$2,$3,$4,$5)`,
+		hashOpaqueToken(refreshToken), familyID, req.ClientID, 0, now.Unix()); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 
@@ -357,13 +399,21 @@ func (s *PostgresServer) tokenFromCode(ctx context.Context, req TokenRequest, no
 }
 
 func (s *PostgresServer) tokenFromRefresh(ctx context.Context, req TokenRequest, now time.Time) (*TokenResponse, error) {
-	var (
-		clientID string
-		scope    string
-	)
-	err := s.db.QueryRow(ctx, `
-		SELECT client_id, scope FROM oauth_tokens WHERE refresh_token = $1`, req.RefreshToken).
-		Scan(&clientID, &scope)
+	if err := validateTokenClient(ctx, s, req); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	refreshHash := hashOpaqueToken(req.RefreshToken)
+	var familyID, clientID string
+	var generation, consumedAt, revokedAt int64
+	err = tx.QueryRow(ctx, `
+		SELECT family_id, client_id, generation, consumed_at, revoked_at
+		FROM oauth_refresh_tokens WHERE token_hash = $1 FOR UPDATE`, refreshHash).
+		Scan(&familyID, &clientID, &generation, &consumedAt, &revokedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, errors.New("invalid refresh token")
 	}
@@ -371,15 +421,79 @@ func (s *PostgresServer) tokenFromRefresh(ctx context.Context, req TokenRequest,
 		return nil, err
 	}
 
-	_ = clientID // available for client validation if desired
-	accessToken := uuid.New().String()
-	expiresAt := now.Add(time.Hour).Unix()
+	if clientID != req.ClientID {
+		return nil, errors.New("refresh token client mismatch")
+	}
+	if revokedAt != 0 {
+		return nil, errors.New("refresh token family revoked")
+	}
+	if consumedAt != 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE oauth_refresh_tokens SET revoked_at = $1
+			WHERE family_id = $2 AND revoked_at = 0`, now.Unix(), familyID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE oauth_tokens SET access_token = NULL, refresh_token = NULL, expires_at = 0
+			WHERE refresh_token IN (
+				SELECT token_hash FROM oauth_refresh_tokens
+				WHERE family_id = $1 AND consumed_at = 0
+			)`, familyID); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("refresh token reuse detected")
+	}
 
-	_, err = s.db.Exec(ctx, `
-		UPDATE oauth_tokens SET access_token = $1, expires_at = $2
-		WHERE refresh_token = $3`,
-		accessToken, expiresAt, req.RefreshToken)
+	var scope string
+	err = tx.QueryRow(ctx, `
+		SELECT scope FROM oauth_tokens
+		WHERE refresh_token = $1 AND client_id = $2 FOR UPDATE`, refreshHash, req.ClientID).Scan(&scope)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("refresh token is not current")
+	}
 	if err != nil {
+		return nil, err
+	}
+	accessToken, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
+	refreshToken, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
+	expiresAt := now.Add(time.Hour).Unix()
+	newRefreshHash := hashOpaqueToken(refreshToken)
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE oauth_tokens SET access_token = $1, refresh_token = $2, expires_at = $3
+		WHERE refresh_token = $4 AND client_id = $5`,
+		hashOpaqueToken(accessToken), newRefreshHash, expiresAt, refreshHash, req.ClientID)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, errors.New("refresh token already used")
+	}
+	tag, err = tx.Exec(ctx, `
+		UPDATE oauth_refresh_tokens SET consumed_at = $1
+		WHERE token_hash = $2 AND consumed_at = 0 AND revoked_at = 0`, now.Unix(), refreshHash)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, errors.New("refresh token already used")
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO oauth_refresh_tokens
+		(token_hash, family_id, client_id, generation, created_at)
+		VALUES ($1,$2,$3,$4,$5)`, newRefreshHash, familyID, req.ClientID, generation+1, now.Unix()); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 
@@ -387,7 +501,7 @@ func (s *PostgresServer) tokenFromRefresh(ctx context.Context, req TokenRequest,
 		AccessToken:  accessToken,
 		TokenType:    "Bearer",
 		ExpiresIn:    int64(time.Hour.Seconds()),
-		RefreshToken: req.RefreshToken,
+		RefreshToken: refreshToken,
 		Scope:        scope,
 	}, nil
 }
@@ -424,7 +538,10 @@ func (s *PostgresServer) tokenFromClientCredentials(ctx context.Context, req Tok
 		return nil, errors.New("grant_type not allowed")
 	}
 
-	accessToken := uuid.New().String()
+	accessToken, err := newOpaqueToken()
+	if err != nil {
+		return nil, err
+	}
 	expiresAt := now.Add(time.Hour).Unix()
 	scopeStr := strings.Join(scopes, " ")
 
@@ -432,7 +549,7 @@ func (s *PostgresServer) tokenFromClientCredentials(ctx context.Context, req Tok
 		INSERT INTO oauth_tokens
 			(access_token, client_id, scope, grant_type, expires_at, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6)`,
-		accessToken, req.ClientID, scopeStr, "client_credentials", expiresAt, now.Unix())
+		hashOpaqueToken(accessToken), req.ClientID, scopeStr, "client_credentials", expiresAt, now.Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -451,9 +568,10 @@ func (s *PostgresServer) tokenFromClientCredentials(ctx context.Context, req Tok
 
 // Revoke invalidates an access or refresh token.
 func (s *PostgresServer) Revoke(ctx context.Context, req RevocationRequest) error {
+	tokenHash := hashOpaqueToken(req.Token)
 	_, err := s.db.Exec(ctx, `
 		DELETE FROM oauth_tokens
-		WHERE access_token = $1 OR refresh_token = $1`, req.Token)
+		WHERE access_token = $1 OR refresh_token = $1`, tokenHash)
 	return err
 }
 
@@ -468,7 +586,7 @@ func (s *PostgresServer) Introspect(ctx context.Context, req IntrospectRequest) 
 	)
 	err := s.db.QueryRow(ctx, `
 		SELECT client_id, user_id, account_id, scope, expires_at
-		FROM oauth_tokens WHERE access_token = $1`, req.Token).
+		FROM oauth_tokens WHERE access_token = $1`, hashOpaqueToken(req.Token)).
 		Scan(&clientID, &userID, &accountID, &scope, &expiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &IntrospectResponse{Active: false}, nil
@@ -588,7 +706,7 @@ func (s *PostgresServer) HasAccess(r *http.Request, resource string, hasRbacAcce
 	)
 	err := s.db.QueryRow(ctx, `
 		SELECT user_id, account_id, scope, expires_at
-		FROM oauth_tokens WHERE access_token = $1`, token).
+		FROM oauth_tokens WHERE access_token = $1`, hashOpaqueToken(token)).
 		Scan(&userID, &accountID, &scope, &expiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
